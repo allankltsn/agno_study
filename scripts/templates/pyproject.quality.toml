@@ -1,0 +1,74 @@
+# Bloco BASE de configuracao das ferramentas de qualidade de codigo.
+#
+# NAO e um pyproject.toml completo: sao as secoes [tool.*] e o grupo de deps de
+# dev que devem ser MESCLADOS ao pyproject.toml do agente. O setup_code_quality.sh
+# usa este arquivo como referencia; ajuste `packages`/`root_package` para o nome
+# do pacote do agente (ex.: `suporte`).
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "bandit[toml]>=1.7",
+    "pip-audit>=2.7",
+    "import-linter>=2.0",
+    "radon>=6.0",
+    "xenon>=0.9",
+    "pre-commit>=3.8",
+    "commitizen>=3.29",
+]
+
+[tool.ruff]
+src = ["src"]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# E/F: pyflakes+pycodestyle; I: isort; UP: pyupgrade; B: bugbear;
+# S: regras de seguranca (bandit-like); C90: complexidade (mccabe).
+select = ["E", "F", "I", "UP", "B", "S", "C90"]
+
+[tool.ruff.lint.per-file-ignores]
+# asserts sao esperados em testes.
+"tests/**" = ["S101"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.mypy]
+python_version = "3.9"
+# Ajuste para o pacote do agente:
+packages = ["suporte"]
+mypy_path = "src"
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# Tipos de libs sem stubs (Agno fica confinada a infrastructure).
+module = ["agno.*", "mangum.*"]
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+
+[tool.importlinter]
+# Ajuste para o pacote do agente:
+root_package = "suporte"
+
+[[tool.importlinter.contracts]]
+name = "Camadas respeitam a direcao de dependencia"
+type = "layers"
+layers = [
+    "suporte.interface",
+    "suporte.application",
+    "suporte.domain",
+]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.1.0"
+tag_format = "v$version"
+update_changelog_on_bump = true

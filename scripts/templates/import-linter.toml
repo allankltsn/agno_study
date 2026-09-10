@@ -1,0 +1,29 @@
+# Contrato de arquitetura em camadas (import-linter), formato standalone.
+#
+# Copiado como `.importlinter` na raiz do agente pelo setup_code_quality.sh.
+# Alternativamente, a mesma config pode viver em [tool.importlinter] no
+# pyproject.toml (ver templates/pyproject.quality.toml).
+#
+# Ajuste `root_package` e os nomes das camadas para o pacote do agente.
+# Regra central: domain/application NAO dependem de interface/infrastructure
+# (Inversao de Dependencia — ver skill agno-project-architecture-solid).
+#
+# Rodar:  uv run lint-imports
+
+[importlinter]
+root_package = "suporte"
+
+[[importlinter.contracts]]
+name = "Camadas respeitam a direcao de dependencia"
+type = "layers"
+layers = [
+    "suporte.interface",
+    "suporte.application",
+    "suporte.domain",
+]
+
+[[importlinter.contracts]]
+name = "Domain nao importa infrastructure"
+type = "forbidden"
+source_modules = ["suporte.domain"]
+forbidden_modules = ["suporte.infrastructure"]

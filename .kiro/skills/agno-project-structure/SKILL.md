@@ -7,7 +7,26 @@ description: Estrutura de código padrão para cada agente Agno de estudo (layou
 
 Layout padrão de um agente isolado. Mantém cada agente simples, legível e independente.
 
-## Layout de pastas
+## Layout do workspace (raiz)
+
+```
+<workspace>/
+├── agents/               # um diretório por agente (isolado, deps próprias via uv)
+│   └── <nome-agente>/
+├── scripts/              # códigos base de uso geral, reaproveitáveis entre agentes
+│   ├── README.md
+│   ├── setup_code_quality.sh   # configura o tooling de qualidade num agente
+│   └── templates/              # configs base (pre-commit, ruff/mypy, import-linter)
+├── CHANGELOG.md
+└── .kiro/                # skills, specs, steering, hooks
+```
+
+A pasta `scripts/` guarda utilitários deterministas e sem lógica de negócio de
+nenhum agente específico (setup de ferramentas, templates de configuração). O
+tooling de qualidade que esses scripts instalam está detalhado na skill
+`agno-code-quality-tools`.
+
+## Layout de pastas (agente)
 
 ```
 agents/<nome-agente>/
@@ -18,6 +37,8 @@ agents/<nome-agente>/
 ├── README.md             # o que este agente estuda + como rodar
 ├── main.py               # ponto de entrada (run/stream)
 ├── config.py             # leitura de env + model factory
+├── prompts/
+│   └── system_prompt.md  # prompt de preferencia (fonte canonica; enviado ao S3)
 └── tests/
     └── test_smoke.py     # smoke test opcional do run
 ```
@@ -29,6 +50,16 @@ Para agentes maiores (RAG, multimodal), adicione módulos por responsabilidade:
 ├── memory.py             # setup de Storage/Memory (nível memória)
 └── tools.py              # tools customizadas (nível tools)
 ```
+
+## Prompts de preferência (bucket S3 + fallback local)
+
+Os prompts de preferência (persona + regras canônicas) são a fonte de verdade e
+ficam versionados num **bucket S3**, lidos na montagem. O arquivo em
+`prompts/system_prompt.md` é a **fonte canônica do repositório**: no dev, o
+bootstrap do LocalStack envia esse arquivo para o bucket; em runtime, o agente lê
+do S3 e usa `prompts/system_prompt.md` como **fallback local** se o S3 não estiver
+acessível — assim o agente nunca sobe sem prompt. Ver skills `agno-prompt-system`
+(leitura do S3) e `agno-local-dev-environment` (criação do bucket no bootstrap).
 
 ## config.py — model factory reutilizável
 
