@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Protect Main Branch — Block Direct Agent Commits",
+      "description": "Impede que agentes façam commit diretamente nas branches protegidas (main/master). Antes de qualquer 'git commit', verifica a branch atual; se for protegida, BLOQUEIA a ação (exit 2) e orienta a criar uma feature branch e abrir PR. Garante que toda mudança passe por revisão.",
+      "trigger": "PreToolUse",
+      "matcher": "execute_bash|executeBash|bash|shell",
+      "action": {
+        "type": "command",
+        "command": "INPUT=\"$(cat)\"; CMD=\"$(printf '%s' \"$INPUT\" | (command -v jq >/dev/null 2>&1 && jq -r '.tool_input.command // .toolInput.command // .command // empty' 2>/dev/null || cat))\"; case \"$CMD\" in *\"git commit\"*) BRANCH=\"$(git rev-parse --abbrev-ref HEAD 2>/dev/null)\"; case \"$BRANCH\" in main|master) printf 'Commit direto na branch protegida \"%s\" bloqueado. Crie uma feature branch (ex: git checkout -b feat/minha-mudanca), commite nela e abra um Pull Request para revisao.\\n' \"$BRANCH\" 1>&2; exit 2 ;; esac ;; esac; exit 0",
+        "timeout": 30
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Auto Lint & Format on Save (Senior Standard)",
+      "description": "Detecta a stack do projeto e aplica linter/formatter apropriado ao salvar arquivos de código. Prioriza qualidade e consistência automáticas, sem intervenção manual. Falha silenciosa se a ferramenta não estiver instalada, para nunca bloquear o fluxo.",
+      "trigger": "PostFileSave",
+      "matcher": "\\.(js|jsx|ts|tsx|mjs|cjs|py|go|rs|rb|java|kt|json|css|scss|md|yaml|yml)$",
+      "action": {
+        "type": "command",
+        "command": "FILE=\"$KIRO_FILE_PATH\"; DIR=\"$(dirname \"$FILE\")\"; ROOT=\"$(git -C \"$DIR\" rev-parse --show-toplevel 2>/dev/null || echo \"$DIR\")\"; cd \"$ROOT\" || exit 0; case \"$FILE\" in *.js|*.jsx|*.ts|*.tsx|*.mjs|*.cjs) if [ -f package.json ] && npx --no-install prettier -v >/dev/null 2>&1; then npx --no-install prettier --write \"$FILE\" >/dev/null 2>&1; fi; if [ -f package.json ] && npx --no-install eslint -v >/dev/null 2>&1; then npx --no-install eslint --fix \"$FILE\" >/dev/null 2>&1; fi ;; *.py) if command -v ruff >/dev/null 2>&1; then ruff format \"$FILE\" >/dev/null 2>&1; ruff check --fix \"$FILE\" >/dev/null 2>&1; elif command -v black >/dev/null 2>&1; then black \"$FILE\" >/dev/null 2>&1; fi ;; *.go) if command -v gofmt >/dev/null 2>&1; then gofmt -w \"$FILE\" >/dev/null 2>&1; fi ;; *.rs) if command -v rustfmt >/dev/null 2>&1; then rustfmt \"$FILE\" >/dev/null 2>&1; fi ;; *.rb) if command -v rubocop >/dev/null 2>&1; then rubocop -A \"$FILE\" >/dev/null 2>&1; fi ;; *.json|*.css|*.scss|*.md|*.yaml|*.yml) if npx --no-install prettier -v >/dev/null 2>&1; then npx --no-install prettier --write \"$FILE\" >/dev/null 2>&1; fi ;; esac; exit 0",
+        "timeout": 60
+      }
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Changelog & SemVer Maintainer",
+      "description": "Reforça a disciplina de versionamento a cada turno: manter CHANGELOG.md no formato Keep a Changelog e derivar o próximo número de versão via Semantic Versioning a partir dos Conventional Commits. Ativa a mentalidade de release contínuo e histórico rastreável.",
+      "trigger": "UserPromptSubmit",
+      "action": {
+        "type": "agent",
+        "prompt": "Disciplina de versionamento (aplicar quando a mudança for relevante ao usuário/consumidor):\n\n1. CHANGELOG.md — siga o formato 'Keep a Changelog':\n   - Registre mudanças sob uma seção '## [Unreleased]' nas categorias: Added, Changed, Deprecated, Removed, Fixed, Security.\n   - Cada entrada é uma linha concisa, orientada ao impacto para quem consome o software (não ao detalhe interno).\n   - Ao publicar uma release, mova o conteúdo de [Unreleased] para '## [X.Y.Z] - AAAA-MM-DD'.\n\n2. Semantic Versioning (SemVer X.Y.Z) — derive o incremento a partir dos Conventional Commits desde a última tag:\n   - MAJOR (X): breaking change — commit com 'BREAKING CHANGE:' no corpo ou '!' após o tipo (ex: feat!:).\n   - MINOR (Y): nova funcionalidade retrocompatível — commits 'feat'.\n   - PATCH (Z): correções e ajustes retrocompatíveis — 'fix', 'perf' e afins.\n   - Antes de 1.0.0, trate breaking changes como MINOR e features como PATCH, sinalizando instabilidade.\n\n3. Fluxo prático ao concluir uma mudança relevante:\n   - Atualize/append no CHANGELOG (seção [Unreleased]).\n   - Calcule e proponha o próximo número SemVer com uma justificativa de 1 linha.\n   - Se o usuário aprovar a release, sugira a tag anotada (ex: 'git tag -a vX.Y.Z -m ...') — não crie a tag automaticamente sem confirmação.\n\nNão infle o changelog com ruído interno (refactors puros, formatação) a menos que afetem o consumidor. Seja um curador criterioso do histórico."
+      }
+    }
+  ]
+}

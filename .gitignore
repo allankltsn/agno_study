@@ -1,0 +1,34 @@
+# === Segredos e ambiente local (NUNCA versionar) ===
+.env
+.env.local
+.env.full
+*.env.local
+
+# === Ambientes virtuais Python ===
+.venv/
+venv/
+env/
+
+# === Artefatos Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# === Cache de testes / ferramentas ===
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# === Registros por execução da eval de eficácia (observação, não versionar) ===
+tests/eval/.results/
+
+# === Diversos ===
+sh.exe.stackdump
+*.log
+.DS_Store

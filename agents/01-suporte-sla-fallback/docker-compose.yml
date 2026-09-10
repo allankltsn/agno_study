@@ -1,0 +1,249 @@
+# =============================================================================
+# Ambiente de desenvolvimento LOCAL do agente de suporte (Req 15).
+#
+# Sobe as tecnologias de terceiros necessárias para desenvolver e observar o
+# agente localmente, SEM custo e SEM rede externa:
+#   - LocalStack  -> AWS emulada (API Gateway, Lambda, DynamoDB, Secrets Manager, SSM)
+#   - Ollama      -> provider de LLM local (fallback custo zero) na porta 11434
+#   - AgentOS     -> superfície de acompanhamento do agente (runs/sessions/traces) na 7777
+#   - Observabilidade -> selecionada por PERFIL do Compose (ver abaixo)
+#
+# Perfis de observabilidade (Req 15.2):
+#   - padrão (sem --profile):  sobe o SigNoz (backend OTLP tudo-em-um)
+#   - --profile grafana:       sobe OTel Collector + Grafana + Tempo + Loki + Prometheus
+#   - --profile langfuse:      sobe o Langfuse (tracing focado em LLM), como adicional
+#
+# Exemplos de uso:
+#   docker compose up                      # LocalStack + Ollama + AgentOS + SigNoz (padrão)
+#   docker compose --profile grafana up    # troca o backend para a stack Grafana
+#   docker compose --profile langfuse up   # adiciona o Langfuse ao SigNoz padrão
+#
+# CONFLITO DE PORTA OTLP (Req 15.3):
+#   Tanto o SigNoz (padrão) quanto o OTel Collector (perfil `grafana`) publicam o
+#   MESMO par de portas OTLP no host — 4317 (gRPC) e 4318 (HTTP). Isso é
+#   INTENCIONAL: garante que apenas UM backend de tracing OTLP ocupe a porta por
+#   vez. Se os dois perfis forem ativados ao mesmo tempo
+#   (ex.: `docker compose --profile grafana up`, que também sobe os serviços do
+#   perfil padrão), o Compose FALHA ao fazer o bind da porta 4317 já em uso,
+#   sinalizando o conflito. Escolha UM backend de tracing OTLP por vez; o
+#   `langfuse` pode subir junto porque usa portas próprias.
+#
+# Endpoints por env (Req 15.5): o agente lê AWS_ENDPOINT_URL, OTEL_EXPORTER_OTLP_ENDPOINT
+# e OLLAMA_HOST do ambiente (ver .env.local.example) — o código não muda entre
+# local e produção.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # LocalStack — AWS emulada (Req 15.1)
+  # Serviços habilitados: apigateway, lambda, dynamodb, secretsmanager, ssm.
+  # O script de bootstrap (localstack/init/01-bootstrap.sh — task 20.4) é montado
+  # em /etc/localstack/init/ready.d e roda quando o LocalStack fica pronto,
+  # criando a tabela DynamoDB e o segredo de forma idempotente (Req 15.7/15.8).
+  # ---------------------------------------------------------------------------
+  localstack:
+    # Imagem única do LocalStack for AWS (desde mar/2026). A tag antiga `:3`
+    # (community) é anterior a essa unificação; `latest` exige LOCALSTACK_AUTH_TOKEN.
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566" # edge port único do LocalStack (todos os serviços AWS)
+    environment:
+      - SERVICES=apigateway,lambda,dynamodb,secretsmanager,ssm
+      - DEBUG=0
+      - AWS_DEFAULT_REGION=us-east-1
+      # Auth token vem do ambiente (.env) — NUNCA hardcoded/versionado. Necessário
+      # para ativar os recursos licenciados e para o container aparecer no seu
+      # workspace em https://app.localstack.cloud. Sem token válido, o LocalStack
+      # apenas avisa e não ativa esses recursos.
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN:-}
+      - LOCALSTACK_APP_INSPECTOR=${LOCALSTACK_APP_INSPECTOR:-}
+    volumes:
+      # Script de bootstrap idempotente executado quando o LocalStack fica pronto.
+      - ./localstack/init:/etc/localstack/init/ready.d
+      # Socket do Docker para o serviço de Lambda do LocalStack.
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Ollama — provider de LLM local / fallback (Req 15.1, 15.5)
+  # O agente aponta para ele via OLLAMA_HOST (ex.: http://ollama:11434 na rede
+  # do Compose, ou http://localhost:11434 a partir do host).
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      # Persiste os modelos baixados entre reinícios (evita re-download).
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # AgentOS — acompanhamento do agente na porta 7777 (Req 15.4)
+  # "Veste" build_agent_for_agentos() do composition_root, sem duplicar domínio.
+  # Roda agentos/app.py (task 20.2). Como o Dockerfile de produção (task 14.5) é
+  # do caminho Lambda, aqui usamos uma imagem Python enxuta e instalamos o projeto
+  # com uv para servir a app FastAPI do AgentOS com uvicorn.
+  # ---------------------------------------------------------------------------
+  agentos:
+    image: python:3.12-slim
+    working_dir: /app
+    command: >
+      bash -c "pip install --no-cache-dir uv &&
+               uv sync &&
+               uv run python -m uvicorn agentos.app:app --host 0.0.0.0 --port 7777"
+    ports:
+      - "7777:7777"
+    volumes:
+      - ./:/app
+      # Volume anônimo mascara o .venv do HOST (criado no Windows) para que ele
+      # NÃO vaze para dentro do container. Sem isto, `uv sync` no container Linux
+      # tenta manipular o .venv do Windows montado via bind e falha com
+      # "failed to remove directory /app/.venv/Lib: Input/output error (os error 5)".
+      # Assim o container cria e usa o próprio .venv Linux, isolado do host.
+      - /app/.venv
+    environment:
+      # Endpoints por env (Req 15.5) — nomes das vars vindos de .env.local.example.
+      - MODEL_PROVIDER_ORDER=${MODEL_PROVIDER_ORDER:-openai,ollama}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      # Dentro da rede do Compose os serviços se enxergam pelo nome.
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:-http://localstack:4566}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-test}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-test}
+      # Endpoint OTLP: aponta para o backend de observabilidade ativo (SigNoz por
+      # padrão, ou o OTel Collector no perfil grafana — ambos escutam em 4317).
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - APP_ENV=${APP_ENV:-local}
+    depends_on:
+      - ollama
+      - localstack
+
+  # ---------------------------------------------------------------------------
+  # Observabilidade — PERFIL PADRÃO: SigNoz (backend OTLP tudo-em-um) (Req 15.2)
+  # Recebe traces/logs/métricas via OTLP nas portas 4317 (gRPC) e 4318 (HTTP).
+  # Ocupa as MESMAS portas OTLP que o OTel Collector do perfil grafana (Req 15.3).
+  # ---------------------------------------------------------------------------
+  signoz:
+    image: signoz/signoz-otel-collector:latest
+    # PERFIL `signoz`: sobe SOMENTE com `docker compose --profile signoz up`.
+    # Antes este servico nao tinha perfil e subia sempre — inclusive no
+    # `--profile grafana` —, disputando as portas OTLP 4317/4318 com o
+    # otel-collector e causando "port is already allocated". Isolando-o num
+    # perfil proprio, cada backend OTLP ocupa as portas por vez, sem conflito
+    # (Req 15.2/15.3). Sem nenhum --profile, o nucleo sobe sem backend OTLP e o
+    # agente apenas nao exporta tracing (degradacao graciosa, Req 16.2).
+    profiles: ["signoz"]
+    ports:
+      - "4317:4317" # OTLP gRPC  (conflita de propósito com otel-collector — Req 15.3)
+      - "4318:4318" # OTLP HTTP
+      - "3301:3301" # UI do SigNoz
+    volumes:
+      - signoz-data:/var/lib/signoz
+
+  # ---------------------------------------------------------------------------
+  # Observabilidade — PERFIL `grafana`: OTel Collector + Grafana + Tempo + Loki + Prometheus
+  # O Collector recebe OTLP e faz fan-out dos três sinais para os backends
+  # dedicados. Config em otel/collector-config.yaml e datasources do Grafana em
+  # grafana/datasources.yaml (ambos criados na task 20.5). (Req 15.2)
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    profiles: ["grafana"]
+    command: ["--config=/etc/otel/collector-config.yaml"]
+    volumes:
+      - ./otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
+    ports:
+      - "4317:4317" # OTLP gRPC  (mesma porta do SigNoz — só um por vez, Req 15.3)
+      - "4318:4318" # OTLP HTTP
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+
+  tempo:
+    image: grafana/tempo:latest
+    profiles: ["grafana"]
+    command: ["-target=all", "-storage.trace.backend=local", "-storage.trace.local.path=/var/tempo"]
+    volumes:
+      - tempo-data:/var/tempo
+
+  loki:
+    image: grafana/loki:latest
+    profiles: ["grafana"]
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - loki-data:/loki
+
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["grafana"]
+    volumes:
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["grafana"]
+    ports:
+      - "3000:3000" # UI do Grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    volumes:
+      # Datasources Tempo/Loki/Prometheus provisionados (task 20.5).
+      - ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+
+  # ---------------------------------------------------------------------------
+  # Observabilidade — PERFIL `langfuse` (opcional/adicional): tracing focado em LLM
+  # Usa portas próprias (3100 no host), então pode subir junto de SigNoz ou da
+  # stack Grafana sem conflito de porta OTLP. (Req 15.2)
+  # ---------------------------------------------------------------------------
+  langfuse-db:
+    image: postgres:16-alpine
+    profiles: ["langfuse"]
+    environment:
+      - POSTGRES_USER=langfuse
+      - POSTGRES_PASSWORD=langfuse
+      - POSTGRES_DB=langfuse
+    volumes:
+      - langfuse-db-data:/var/lib/postgresql/data
+
+  langfuse:
+    image: langfuse/langfuse:latest
+    profiles: ["langfuse"]
+    ports:
+      - "3100:3000" # UI do Langfuse (porta própria, sem conflito com Grafana/SigNoz)
+    environment:
+      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      - NEXTAUTH_URL=http://localhost:3100
+      - NEXTAUTH_SECRET=local-dev-secret
+      - SALT=local-dev-salt
+    depends_on:
+      - langfuse-db
+
+# =============================================================================
+# Volumes nomeados — persistem dados/modelos entre reinícios do Compose.
+# =============================================================================
+volumes:
+  ollama-models:
+  signoz-data:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:
+  langfuse-db-data:

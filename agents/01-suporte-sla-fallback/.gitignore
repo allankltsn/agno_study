@@ -1,0 +1,17 @@
+# Segredos e ambiente local (nunca versionar)
+.env
+.env.local
+.env.full
+
+# Ambientes virtuais
+.venv/
+
+# Artefatos Python
+__pycache__/
+*.pyc
+
+# Cache de testes
+.pytest_cache/
+
+# Registros por execução da eval de eficácia (auxílio de observação, não versionar)
+tests/eval/.results/

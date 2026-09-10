@@ -1,0 +1,15 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Documentation Reminder — New Module Created",
+      "description": "Quando um novo módulo relevante é criado (service, controller, handler, use case, repository, componente público, etc.), lembra de documentar contrato, responsabilidade e integração. Reforça manutenibilidade e knowledge-sharing de longo prazo.",
+      "trigger": "PostFileCreate",
+      "matcher": "(services?|controllers?|handlers?|usecases?|use_cases?|repositor(y|ies)|domain|api|routes?|components?|modules?)/.*\\.(ts|tsx|js|jsx|py|go|rs|java|kt|rb)$",
+      "action": {
+        "type": "agent",
+        "prompt": "Um novo módulo foi criado no projeto. Como arquiteto sênior, garanta que ele seja sustentável e descobrível:\n\n1. Confirme que o módulo tem UMA responsabilidade clara (SRP) e nome que revela intenção.\n2. Documente na fronteira pública: propósito do módulo, contrato (entradas/saídas/erros) e efeitos colaterais relevantes. Prefira docstrings/JSDoc no próprio código a documentação externa desacoplada.\n3. Se o módulo expõe uma API, endpoint ou serviço público, verifique se README/docs de arquitetura precisam ser atualizados e proponha o diff.\n4. Sinalize dependências introduzidas e se elas respeitam as fronteiras de camada (domínio não depende de infraestrutura).\n5. Se a lógica for crítica, sugira os testes mínimos (caminho feliz + limites + erro) — sem criá-los automaticamente, apenas recomende.\n\nSeja objetivo: liste apenas o que realmente agrega, evitando burocracia."
+      }
+    }
+  ]
+}

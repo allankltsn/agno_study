@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Commit Lint Guard — Conventional Commits Enforcement",
+      "description": "Antes de executar um 'git commit', valida a mensagem contra a especificação Conventional Commits. Se a mensagem não estiver em conformidade, pede confirmação/correção antes de prosseguir. Garante histórico semântico, base para geração automática de CHANGELOG e cálculo de SemVer.",
+      "trigger": "PreToolUse",
+      "matcher": "execute_bash|executeBash|bash|shell",
+      "action": {
+        "type": "command",
+        "command": "INPUT=\"$(cat)\"; CMD=\"$(printf '%s' \"$INPUT\" | (command -v jq >/dev/null 2>&1 && jq -r '.tool_input.command // .toolInput.command // .command // empty' 2>/dev/null || cat))\"; case \"$CMD\" in *\"git commit\"*) MSG=\"$(printf '%s' \"$CMD\" | grep -oE -- \"-m[[:space:]]*(\\\"[^\\\"]*\\\"|'[^']*')\" | head -n1 | sed -E \"s/^-m[[:space:]]*//; s/^[\\\"']//; s/[\\\"']$//\")\"; if [ -z \"$MSG\" ]; then exit 0; fi; if printf '%s' \"$MSG\" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\\([a-z0-9._-]+\\))?(!)?: .{1,}'; then exit 0; else printf '{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"A mensagem de commit nao segue Conventional Commits (tipo(escopo): descricao). Tipos validos: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert. Ex: feat(auth): adiciona refresh token. Ajuste a mensagem ou confirme para prosseguir.\"}}'; exit 0; fi ;; esac; exit 0",
+        "timeout": 30
+      }
+    }
+  ]
+}

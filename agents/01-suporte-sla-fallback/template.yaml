@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+# =============================================================================
+# template.yaml — Deploy PADRÃO (Mangum + Lambda + Lambda Layer) via AWS SAM
+# -----------------------------------------------------------------------------
+# Agente 01 — Suporte com SLA e fallback de provider (Req 14, 16).
+#
+# Caminho de deploy PADRÃO (Req 14.5): a MESMA app FastAPI (interface/api/api.py)
+# é adaptada ao evento do API Gateway pelo handler Mangum
+# (`handler = Mangum(app)` em src/suporte/interface/api/main.py). As dependências
+# pesadas (agno, fastapi, mangum, SDKs de provider) ficam num Lambda Layer para
+# manter o pacote da função enxuto. Quando o pacote excede o limite de Lambda
+# Layers (250 MB), usa-se o caminho ALTERNATIVO (container + AWS Lambda Web
+# Adapter, ver Dockerfile) — fora do escopo deste template.
+#
+# Observabilidade (Req 16): `Tracing: Active` liga o AWS X-Ray na função e no
+# API Gateway. O tracing OpenTelemetry do Agno é exportado por OTLP para o
+# endpoint em `OTEL_EXPORTER_OTLP_ENDPOINT`; em produção esse endpoint aponta
+# para o collector da ADOT layer (ver nota no bloco Layers da função), que
+# encaminha os spans OTel para o X-Ray — SEM alterar o código do agente.
+#
+# IMPORTANTE: este é um arquivo de INFRAESTRUTURA. Ele NÃO faz deploy sozinho.
+# O deploy real (`sam build` + `sam deploy`, ou ensaio no LocalStack) é um passo
+# manual/CI separado.
+# =============================================================================
+
+Description: >
+  Agente 01 (Suporte SLA + fallback) — API FastAPI publicada atrás do AWS API
+  Gateway via AWS Lambda (handler Mangum) com Lambda Layer para deps pesadas.
+  Tracing X-Ray ativo; OTel -> X-Ray via ADOT layer. Deploy padrão (Req 14).
+
+# -----------------------------------------------------------------------------
+# Parâmetros: permitem trocar ordem/timeouts de provider e endpoint OTLP no
+# deploy sem editar o template (mesma filosofia de "config por env" do agente).
+# -----------------------------------------------------------------------------
+Parameters:
+  AppEnv:
+    Type: String
+    Default: production
+    Description: >
+      Ambiente de execução (APP_ENV). Use dev/development/local para ligar o
+      debug_mode do Agno (Req 16.6); qualquer outro valor mantém debug desligado
+      (Req 16.7).
+  ModelProviderOrder:
+    Type: String
+    Default: openai,groq
+    Description: >
+      Ordem de tentativa/fallback dos providers (MODEL_PROVIDER_ORDER), separada
+      por vírgula. Trocar a ordem reordena o fallback sem tocar em domain/
+      nem application/ (Req 4.2).
+  LlmPerAttemptTimeout:
+    Type: String
+    Default: "10"
+    Description: Timeout de uma única tentativa a um provider, em segundos (Req 6.1).
+  LlmTotalTimeout:
+    Type: String
+    # <= 25s deixa margem sob o Timeout de 29s da função (Req 6.3, RNF-01).
+    Default: "25"
+    Description: >
+      Limite total da requisição incluindo fallback, em segundos (Req 6.3). Deve
+      ser <= ao Timeout da função (29s) para o SLA caber na janela do Lambda.
+  LlmMaxAttempts:
+    Type: String
+    Default: "2"
+    Description: Tentativas por provider antes de passar ao próximo (Req 7.1).
+  LlmBackoffBase:
+    Type: String
+    Default: "0.5"
+    Description: Base do backoff exponencial entre tentativas, em segundos (Req 7.2).
+  OtelExporterOtlpEndpoint:
+    Type: String
+    Default: ""
+    Description: >
+      Endpoint OTLP do tracing (OTEL_EXPORTER_OTLP_ENDPOINT, Req 16.1). Em
+      produção, aponte para o collector local da ADOT layer (ex.:
+      http://localhost:4317) para encaminhar os spans OTel ao X-Ray. Vazio
+      desabilita a exportação sem interromper a execução (Req 16.2).
+
+# -----------------------------------------------------------------------------
+# Globals: padrões aplicados a todas as funções Serverless deste template.
+# -----------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.12
+    # Timeout <= 29s: o API Gateway (REST) tem timeout de integração máximo de
+    # 29s; manter a função em 29s evita que o Lambda seja cortado depois do
+    # gateway já ter desistido (Req 14.3/14.4, RNF-01).
+    Timeout: 29
+    MemorySize: 512
+    # X-Ray ativo em toda função (Req 16): captura os spans nativos do Lambda; a
+    # ADOT layer complementa encaminhando os spans OTel do Agno para o X-Ray.
+    Tracing: Active
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Lambda Layer: dependências pesadas (agno, fastapi, mangum, SDKs de provider).
+  # Mantê-las na layer deixa o pacote da função pequeno e o deploy mais rápido.
+  # O conteúdo da layer é montado por `sam build` a partir de dependencies/
+  # (requirements.txt com agno, fastapi, mangum, openai/groq SDKs, opentelemetry).
+  # Se o total ultrapassar 250 MB, migre para o caminho container (Dockerfile).
+  # ---------------------------------------------------------------------------
+  DependenciasLayer:
+    Type: AWS::Serverless::LayerVersion
+    Metadata:
+      # SAM instala as dependências Python declaradas em dependencies/requirements.txt
+      BuildMethod: python3.12
+    Properties:
+      LayerName: suporte-sla-fallback-deps
+      Description: >
+        Deps pesadas do Agente 01 (agno, fastapi, mangum, SDKs de provider,
+        opentelemetry). Isola-as do código da função (Req 14).
+      ContentUri: dependencies/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Retain
+
+  # ---------------------------------------------------------------------------
+  # API HTTP: API Gateway REST que publica a app FastAPI (Req 14.4). O estágio
+  # habilita o tracing X-Ray para correlacionar o trace do gateway com o do
+  # Lambda e com os spans OTel encaminhados pela ADOT layer.
+  # ---------------------------------------------------------------------------
+  SuporteApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      TracingEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # Função Lambda: roda o handler Mangum que adapta o evento do API Gateway à
+  # app FastAPI (caminho de deploy padrão, Req 14.5).
+  #
+  # Handler: aponta para `handler` em src/suporte/interface/api/main.py — ou
+  # seja, o `main.handler` referido na task, cujo caminho de importação completo
+  # (com CodeUri: src/) é `suporte.interface.api.main.handler`.
+  # ---------------------------------------------------------------------------
+  SuporteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: suporte-sla-fallback
+      CodeUri: src/
+      # `handler = Mangum(app)` em src/suporte/interface/api/main.py (Req 14.5).
+      Handler: suporte.interface.api.main.handler
+      Layers:
+        - !Ref DependenciasLayer
+        # NOTA (ADOT / OTel -> X-Ray): para encaminhar o tracing OpenTelemetry do
+        # Agno ao X-Ray em produção, anexe também a AWS Distro for OpenTelemetry
+        # (ADOT) Lambda layer aqui, ex.:
+        #   - arn:aws:lambda:<region>:901920570463:layer:aws-otel-python-amd64-ver-1-x-x:1
+        # e defina OTEL_EXPORTER_OTLP_ENDPOINT (abaixo) para o collector local da
+        # ADOT layer (http://localhost:4317). O ARN exato depende da região e da
+        # versão; consulte a documentação da ADOT. (Req 16.1)
+      Environment:
+        Variables:
+          # Ambiente e debug (Req 16.6/16.7).
+          APP_ENV: !Ref AppEnv
+          # Ordem/timeouts de provider por env (Req 4.2, 6.x, 7.x) — trocar aqui
+          # reordena/ajusta o SLA sem tocar no código do agente.
+          MODEL_PROVIDER_ORDER: !Ref ModelProviderOrder
+          LLM_PER_ATTEMPT_TIMEOUT: !Ref LlmPerAttemptTimeout
+          LLM_TOTAL_TIMEOUT: !Ref LlmTotalTimeout
+          LLM_MAX_ATTEMPTS: !Ref LlmMaxAttempts
+          LLM_BACKOFF_BASE: !Ref LlmBackoffBase
+          # Endpoint OTLP do tracing (Req 16.1). Aponte para o collector da ADOT
+          # layer em produção; vazio desabilita a exportação sem interromper.
+          OTEL_EXPORTER_OTLP_ENDPOINT: !Ref OtelExporterOtlpEndpoint
+      # Eventos do API Gateway: publica a MESMA app FastAPI atrás do gateway
+      # (Req 14.4). A rota "proxy" encaminha qualquer método/caminho para o
+      # Mangum, que roteia internamente (/chat, /chat/stream, /health, docs).
+      Events:
+        ProxyAny:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SuporteApi
+            Path: /{proxy+}
+            Method: ANY
+        Root:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SuporteApi
+            Path: /
+            Method: ANY
+
+# -----------------------------------------------------------------------------
+# Saídas: URL base da API e nomes dos recursos para uso em smoke tests / CI.
+# -----------------------------------------------------------------------------
+Outputs:
+  ApiBaseUrl:
+    Description: URL base da API publicada no API Gateway (estágio prod).
+    Value: !Sub "https://${SuporteApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  FunctionName:
+    Description: Nome da função Lambda que roda o handler Mangum.
+    Value: !Ref SuporteFunction
+  DependenciasLayerArn:
+    Description: ARN da Lambda Layer com as dependências pesadas.
+    Value: !Ref DependenciasLayer

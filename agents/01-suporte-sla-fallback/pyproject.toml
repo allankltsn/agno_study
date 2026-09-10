@@ -1,0 +1,71 @@
+[project]
+name = "suporte-sla-fallback"
+version = "0.1.0"
+description = "Agente 01 — Suporte de primeiro nível com SLA e fallback de provider de LLM"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    # Agno v2 fixada ao major 2 (tipos Agno confinados à camada infrastructure).
+    "agno>=2.0,<3.0",
+    # SDKs dos providers usados via Agno (agno.models.*): o pacote agno sozinho
+    # NAO os instala (carga lazy; faltando gera ImportError). openai cobre
+    # OpenAIChat (e e usado pelo Groq da Agno); groq cobre o Groq; ollama o local.
+    "openai>=1.0,<2.0",
+    "groq>=0.11,<1.0",
+    "ollama>=0.3,<1.0",
+    "python-dotenv>=1.0,<2.0",
+    # OpenTelemetry para tracing distribuído (Req 16). Importado de forma
+    # preguiçosa/guardada em infrastructure/observability/tracing.py, de modo que
+    # o núcleo (CLI) continua funcionando mesmo sem estes pacotes instalados.
+    "opentelemetry-api>=1.20,<2.0",
+    "opentelemetry-sdk>=1.20,<2.0",
+    "opentelemetry-exporter-otlp>=1.20,<2.0",
+    # API HTTP / serverless (Req 14): app FastAPI + validação Pydantic na borda.
+    # Os tipos da Agno seguem confinados à infrastructure; esta camada só depende
+    # do caso de uso e dos DTOs.
+    "fastapi>=0.110,<1.0",
+    "pydantic>=2.0,<3.0",
+    # Adapter ASGI que liga o evento do API Gateway à app FastAPI no caminho de
+    # deploy padrão (handler = Mangum(app) em interface/api/main.py, Req 14.5).
+    "mangum>=0.17,<1.0",
+    # Servidor ASGI usado para servir a app FastAPI localmente e o AgentOS
+    # (docker-compose: `uvicorn agentos.app:app`, Req 15.4). No deploy padrao
+    # (Mangum + Lambda) nao e necessario, mas e leve e simplifica dev/local.
+    "uvicorn[standard]>=0.30,<1.0",
+    # Requerido pelo AgentOS: agent_os.get_app() registra rotas FastAPI com
+    # Form/File (upload multimodal). Sem python-multipart, o FastAPI recusa montar
+    # essas rotas (RuntimeError no get_app). So e usado no AgentOS local.
+    "python-multipart>=0.0.9,<1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "hypothesis>=6.0",
+    # `fastapi.testclient.TestClient` é construído sobre o cliente HTTP `httpx`
+    # (Starlette exige httpx para exercitar a app ASGI em memória, sem rede).
+    "httpx>=0.27,<1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/suporte"]
+
+[tool.pytest.ini_options]
+# `src` no pythonpath permite importar o pacote `suporte` sem instalar o projeto.
+pythonpath = ["src"]
+testpaths = ["tests"]
+# Marcadores que separam os testes lentos/não-determinísticos/dependentes de rede
+# do gate rápido de PR (Req 17.1, 17.11). Declará-los aqui evita o warning de
+# "unknown marker" e documenta o significado de cada camada.
+#
+# Gate de PR (rápido, determinístico) — executa tudo exceto as camadas abaixo:
+#     pytest -m "not e2e and not system and not integration"
+markers = [
+    "e2e: comportamento do agente com LLM real/Ollama (nightly, fora do gate de PR)",
+    "system: sistema real / deploy vivo (LocalStack ou AWS)",
+    "integration: providers reais (requer chaves)",
+]

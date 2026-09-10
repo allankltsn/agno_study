@@ -1,0 +1,49 @@
+# =============================================================================
+# Datasources provisionados no Grafana — PERFIL `grafana` do docker-compose (Req 15.2).
+#
+# Este arquivo é montado em /etc/grafana/provisioning/datasources/datasources.yaml
+# (ver serviço `grafana` no docker-compose.yml). O Grafana lê os datasources daqui
+# na inicialização, então os três sinais já aparecem prontos, sem cadastro manual:
+#   - Tempo      -> traces      (fan-out do OTel Collector)
+#   - Loki       -> logs
+#   - Prometheus -> métricas
+#
+# As URLs usam os NOMES DOS SERVIÇOS do docker-compose (tempo, loki, prometheus)
+# nas portas padrão de cada imagem, resolvidos pela rede interna do Compose.
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+  # ---------------------------------------------------------------------------
+  # Tempo — backend de traces. Recebe os spans encaminhados pelo OTel Collector.
+  # ---------------------------------------------------------------------------
+  - name: Tempo
+    type: tempo
+    access: proxy
+    uid: tempo
+    url: http://tempo:3200 # porta HTTP padrão do Tempo
+    jsonData:
+      # Correlaciona traces <-> logs no Loki pelo campo request_id (Req 16.4).
+      tracesToLogsV2:
+        datasourceUid: loki
+
+  # ---------------------------------------------------------------------------
+  # Loki — backend de logs. Recebe o log estruturado (JSON) por requisição.
+  # ---------------------------------------------------------------------------
+  - name: Loki
+    type: loki
+    access: proxy
+    uid: loki
+    url: http://loki:3100 # porta HTTP padrão do Loki
+
+  # ---------------------------------------------------------------------------
+  # Prometheus — backend de métricas. Recebe as métricas via remote write do
+  # OTel Collector e é a fonte padrão de dashboards de métricas.
+  # ---------------------------------------------------------------------------
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: prometheus
+    url: http://prometheus:9090 # porta HTTP padrão do Prometheus
+    isDefault: true

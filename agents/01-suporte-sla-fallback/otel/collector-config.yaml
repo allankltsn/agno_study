@@ -1,0 +1,76 @@
+# =============================================================================
+# Config do OpenTelemetry Collector — PERFIL `grafana` do docker-compose (Req 15.2).
+#
+# Papel: ser o ponto único de entrada OTLP no perfil `grafana`. O agente exporta
+# traces/logs/métricas via OTEL_EXPORTER_OTLP_ENDPOINT (http://otel-collector:4317)
+# e este Collector faz o *fan-out* dos três sinais para os backends dedicados:
+#   - traces   -> Tempo        (grafana/tempo)
+#   - logs     -> Loki         (grafana/loki)
+#   - métricas -> Prometheus   (prom/prometheus, via remote write)
+#
+# Os hostnames (tempo, loki, prometheus, otel-collector) são os NOMES DOS
+# SERVIÇOS no docker-compose.yml — dentro da rede do Compose os serviços se
+# enxergam por esses nomes. As portas OTLP 4317/4318 batem com as publicadas
+# pelo serviço `otel-collector` (e, de propósito, com as do SigNoz — Req 15.3).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Receivers — por onde os sinais chegam ao Collector.
+# OTLP nas duas variantes de transporte que o agente pode usar.
+# -----------------------------------------------------------------------------
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317 # OTLP gRPC (endpoint padrão do agente)
+      http:
+        endpoint: 0.0.0.0:4318 # OTLP HTTP
+
+# -----------------------------------------------------------------------------
+# Processors — tratamento antes de exportar.
+# `batch` agrupa os dados para reduzir chamadas aos backends (recomendado).
+# -----------------------------------------------------------------------------
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+# -----------------------------------------------------------------------------
+# Exporters — para onde cada sinal é enviado (um backend por sinal).
+# -----------------------------------------------------------------------------
+exporters:
+  # Traces -> Tempo, via OTLP gRPC na porta padrão do Tempo (4317).
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true # rede local do Compose, sem TLS
+
+  # Logs -> Loki, via seu push endpoint OTLP HTTP.
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+
+  # Métricas -> Prometheus, via remote write (Prometheus sobe com o receiver
+  # remote-write habilitado). Endpoint padrão do Prometheus é a porta 9090.
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    tls:
+      insecure: true
+
+# -----------------------------------------------------------------------------
+# Service — liga receivers -> processors -> exporters em pipelines por sinal.
+# Cada pipeline roteia um tipo de sinal para o seu backend dedicado.
+# -----------------------------------------------------------------------------
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/loki]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheusremotewrite]
