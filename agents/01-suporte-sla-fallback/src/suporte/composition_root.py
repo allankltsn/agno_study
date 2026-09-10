@@ -225,6 +225,58 @@ def _build_fallback(settings: Settings) -> FallbackLLM:
     )
 
 
+def _build_knowledge_if_enabled(settings: Settings) -> Any:
+    """Monta o `Knowledge` da Agno quando o RAG está habilitado, senão ``None``.
+
+    O RAG é plugável por env (ver `config.py`/`RagConfig`): quando
+    `settings.rag.enabled` é ``False`` (padrão), retorna ``None`` e o agente é
+    montado sem base de conhecimento — comportamento idêntico ao atual. Quando
+    ligado, delega à `vector_db_factory.build_knowledge`, que seleciona o backend
+    (`lancedb`/`pgvector`/`s3vectors`) por `RAG_VECTOR_DB`, com import tardio da
+    Agno (Req 12.6).
+
+    A verificação de configuração obrigatória do backend (ex.: `RAG_PG_DSN` para
+    pgvector) já aconteceu em `load_settings`, nomeando a env var ausente sem expor
+    segredos (Req 10.6, 11.5). O DSN nunca é logado aqui.
+
+    Args:
+        settings: Configuração tipada e validada do agente.
+
+    Returns:
+        Um `Knowledge` da Agno quando o RAG está ligado; ``None`` caso contrário.
+
+    Raises:
+        RuntimeError: Propagada da fábrica quando o backend selecionado não está
+            disponível (ex.: `s3vectors` sem suporte na versão instalada).
+    """
+    if not settings.rag.enabled:
+        return None
+    # Import tardio do módulo de infraestrutura de RAG (mantém a Agno confinada).
+    from suporte.infrastructure.knowledge.vector_db_factory import build_knowledge
+
+    return build_knowledge(settings.rag)
+
+
+def _build_db(settings: Settings) -> Any:
+    """Monta o `Db` do Agno para memory & sessions (DynamoDB por padrão).
+
+    Delega à `db_factory.build_db`, que seleciona o backend por
+    `settings.persistence.backend` (`dynamodb` por padrão; `sqlite` como fallback
+    local), com import tardio da Agno/boto3 (Req 12.6). As credenciais AWS são
+    lidas pelo boto3 do ambiente — nunca manipuladas ou logadas aqui (Req 10.6,
+    11.5).
+
+    Args:
+        settings: Configuração tipada e validada do agente.
+
+    Returns:
+        Um `Db` do Agno (`DynamoDb` ou `SqliteDb`) pronto para injetar no `Agent`.
+    """
+    from suporte.infrastructure.persistence.db_factory import build_db
+
+    return build_db(settings.persistence)
+
+
 def build_answer_question() -> AnswerQuestion:
     """Monta o caso de uso `AnswerQuestion` com o `FallbackLLM` já composto.
 
@@ -327,6 +379,18 @@ def build_agent_for_agentos() -> Any:
             "Provider primário não suportado para o AgentOS: '{}'.".format(cfg.name)
         )
 
+    # RAG plugável por env (Knowledge): montado só quando RAG_ENABLED (settings.rag
+    # .enabled). O backend do vector DB (lancedb/pgvector/s3vectors) é escolhido por
+    # `RAG_VECTOR_DB`; o wiring vive na infraestrutura (vector_db_factory), então o
+    # composition_root só decide *se* liga a base e a injeta no Agent.
+    knowledge = _build_knowledge_if_enabled(settings)
+
+    # Persistência (memory & sessions) plugável por env: DynamoDB por padrão,
+    # SQLite como fallback local. O `Db` habilita a continuidade da conversa
+    # (sessions) e, quando `AGENT_MEMORY_ENABLED`, os fatos do usuário (memories).
+    # O wiring do backend vive na infraestrutura (db_factory).
+    db = _build_db(settings)
+
     return Agent(
         model=model,
         instructions=_DEFAULT_INSTRUCTIONS,
@@ -334,4 +398,14 @@ def build_agent_for_agentos() -> Any:
         # add_dependencies_to_context=True), no lugar do antigo `context=`.
         dependencies=_PRODUCT_CONTEXT,
         add_dependencies_to_context=True,
+        # Quando o RAG está desligado, `knowledge=None` mantém o comportamento
+        # atual (agente sem base). Ligado, o agente busca na base automaticamente.
+        knowledge=knowledge,
+        search_knowledge=knowledge is not None,
+        # Persistência: o Db guarda sessions/memories no backend configurado
+        # (DynamoDB por padrão). `add_history_to_context` injeta o histórico da
+        # sessão; `enable_user_memories` liga os fatos do usuário quando pedido.
+        db=db,
+        add_history_to_context=True,
+        enable_user_memories=settings.persistence.memory_enabled,
     )

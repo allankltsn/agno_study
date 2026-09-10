@@ -3,9 +3,10 @@
 # 01-bootstrap.sh — Provisiona os recursos AWS que o agente espera no LocalStack.
 #
 # Este script roda automaticamente quando o LocalStack fica pronto (é montado em
-# /etc/localstack/init/ready.d pelo docker-compose). Ele cria, no mínimo:
-#   - uma tabela DynamoDB (Req 15.7);
-#   - um segredo no Secrets Manager (Req 15.7).
+# /etc/localstack/init/ready.d pelo docker-compose). Ele garante:
+#   - um segredo no Secrets Manager (Req 15.7);
+#   - diagnóstico das tabelas DynamoDB de memory/sessions (o Agno as cria no
+#     primeiro uso — ver bloco 1).
 #
 # Requisito central: IDEMPOTÊNCIA (Req 15.8). O LocalStack pode reexecutar os
 # scripts de init em cada boot do container, e o volume de dados pode persistir
@@ -23,7 +24,6 @@ set -euo pipefail
 # Nomes de recursos vêm de env para que o mesmo script sirva local e testes de
 # sistema, sem editar código. Os defaults refletem o domínio do agente (suporte).
 AWS_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-1}}"
-DYNAMODB_TABLE="${DYNAMODB_TABLE:-suporte-sla-sessions}"
 SECRET_NAME="${SECRET_NAME:-suporte-sla-api-keys}"
 # Valor inicial do segredo. Placeholder — nunca um segredo real. O valor de
 # verdade é injetado no ambiente/deploy; aqui só garantimos que o segredo existe.
@@ -32,28 +32,28 @@ SECRET_INITIAL_VALUE="${SECRET_INITIAL_VALUE:-{\"OPENAI_API_KEY\":\"\",\"GROQ_AP
 echo "[bootstrap] Iniciando provisionamento no LocalStack (região=${AWS_REGION})"
 
 # --------------------------------------------------------------------------- #
-# 1) Tabela DynamoDB (idempotente)                                            #
+# 1) Tabelas DynamoDB de memory & sessions                                    #
 # --------------------------------------------------------------------------- #
-# Estratégia: consultar describe-table primeiro. Se a tabela já existe, apenas
-# pulamos a criação. describe-table retorna erro quando a tabela não existe, por
-# isso silenciamos stdout/stderr e testamos o código de saída.
-echo "[bootstrap] Verificando tabela DynamoDB '${DYNAMODB_TABLE}'..."
-if awslocal dynamodb describe-table \
-    --table-name "${DYNAMODB_TABLE}" \
-    --region "${AWS_REGION}" >/dev/null 2>&1; then
-  echo "[bootstrap] Tabela '${DYNAMODB_TABLE}' já existe — nada a fazer (idempotente)."
-else
-  echo "[bootstrap] Tabela '${DYNAMODB_TABLE}' não existe — criando..."
-  # Chave primária simples: 'session_id' (String) como partition key.
-  # PAY_PER_REQUEST evita ter de dimensionar throughput no ambiente local.
-  awslocal dynamodb create-table \
-    --table-name "${DYNAMODB_TABLE}" \
-    --attribute-definitions AttributeName=session_id,AttributeType=S \
-    --key-schema AttributeName=session_id,KeyType=HASH \
-    --billing-mode PAY_PER_REQUEST \
-    --region "${AWS_REGION}" >/dev/null
-  echo "[bootstrap] Tabela '${DYNAMODB_TABLE}' criada."
-fi
+# IMPORTANTE: o Agno (DynamoDb) cria as próprias tabelas de sessions e memories
+# no PRIMEIRO uso, com o schema e os índices (GSIs) que ele espera. Por isso NÃO
+# criamos essas tabelas aqui — criá-las com um schema divergente (ex.: só
+# 'session_id' como chave) quebraria as queries do Agno. Deixamos o Agno
+# gerenciar o schema; o agente só precisa de credenciais/endpoint (já providos
+# via AWS_ENDPOINT_URL/AWS_REGION) e de permissão para criar/ler/escrever
+# (garantida no LocalStack; em produção, ver a policy DynamoDB no template SAM).
+#
+# Apenas verificamos (sem falhar) se as tabelas esperadas já existem, como
+# diagnóstico — o Agno as cria sob demanda se ainda não existirem.
+AGENT_DDB_SESSION_TABLE="${AGENT_DDB_SESSION_TABLE:-suporte-sla-sessions}"
+AGENT_DDB_MEMORY_TABLE="${AGENT_DDB_MEMORY_TABLE:-suporte-sla-memories}"
+for _tbl in "${AGENT_DDB_SESSION_TABLE}" "${AGENT_DDB_MEMORY_TABLE}"; do
+  if awslocal dynamodb describe-table \
+      --table-name "${_tbl}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+    echo "[bootstrap] Tabela DynamoDB '${_tbl}' já existe (gerenciada pelo Agno)."
+  else
+    echo "[bootstrap] Tabela DynamoDB '${_tbl}' será criada pelo Agno no primeiro uso."
+  fi
+done
 
 # --------------------------------------------------------------------------- #
 # 2) Segredo no Secrets Manager (idempotente)                                 #

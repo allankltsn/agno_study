@@ -236,6 +236,34 @@ services:
     depends_on:
       - langfuse-db
 
+  # ---------------------------------------------------------------------------
+  # RAG — PERFIL `pgvector`: Postgres com a extensão pgvector para vector DB.
+  # Sobe SOMENTE com `docker compose --profile pgvector up`, para não pesar no
+  # fluxo padrão de quem usa LanceDB (backend local, sem servidor). O agente
+  # aponta para cá quando RAG_ENABLED=true e RAG_VECTOR_DB=pgvector, via a DSN em
+  # RAG_PG_DSN (ver .env.local.example). A imagem `pgvector/pgvector` já traz a
+  # extensão; o script de init cria `CREATE EXTENSION IF NOT EXISTS vector`
+  # (idempotente). Porta 5433 no host para não colidir com Postgres locais (5432).
+  # ---------------------------------------------------------------------------
+  pgvector:
+    image: pgvector/pgvector:pg16
+    profiles: ["pgvector"]
+    ports:
+      - "5433:5432" # host 5433 -> container 5432 (evita conflito com 5432 local)
+    environment:
+      - POSTGRES_USER=${RAG_PG_USER:-rag}
+      - POSTGRES_PASSWORD=${RAG_PG_PASSWORD:-rag}
+      - POSTGRES_DB=${RAG_PG_DB:-rag}
+    volumes:
+      - pgvector-data:/var/lib/postgresql/data
+      # Habilita a extensão `vector` no primeiro boot (idempotente).
+      - ./pgvector/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RAG_PG_USER:-rag} -d ${RAG_PG_DB:-rag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 # =============================================================================
 # Volumes nomeados — persistem dados/modelos entre reinícios do Compose.
 # =============================================================================
@@ -247,3 +275,4 @@ volumes:
   prometheus-data:
   grafana-data:
   langfuse-db-data:
+  pgvector-data:

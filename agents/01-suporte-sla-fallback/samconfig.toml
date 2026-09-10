@@ -1,0 +1,142 @@
+# =============================================================================
+# samconfig.toml — Configuração de deploy do AWS SAM, MODULAR POR AMBIENTE.
+# -----------------------------------------------------------------------------
+# Cada ambiente de deploy é um "config environment" próprio (dev/staging/prod),
+# selecionado com `--config-env`:
+#
+#   sam build
+#   sam deploy --config-env dev
+#   sam deploy --config-env staging
+#   sam deploy --config-env prod
+#
+# O que muda entre ambientes vive SÓ aqui, em `parameter_overrides` — o
+# `template.yaml` (infra) e o código do agente (lê tudo por env var) não mudam.
+# Esta é a mesma filosofia de "config por env" do agente, aplicada ao deploy.
+#
+# SEGREDOS: não coloque valores reais de RAG_PG_DSN nem chaves aqui. Este arquivo
+# é versionado. Injete segredos no momento do deploy (ex.: variável de shell) ou,
+# de preferência, resolva-os de Secrets Manager em runtime. Ex.:
+#   sam deploy --config-env prod \
+#     --parameter-overrides "RagPgDsn=$RAG_PG_DSN"
+# O parâmetro RagPgDsn é NoEcho no template (não aparece nos eventos do CFN).
+# =============================================================================
+
+version = 0.1
+
+# -----------------------------------------------------------------------------
+# Defaults globais aplicados a todos os comandos/ambientes (podem ser
+# sobrescritos por ambiente abaixo).
+# -----------------------------------------------------------------------------
+[default.global.parameters]
+stack_name = "suporte-sla-fallback"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+region = "us-east-1"
+
+# =============================================================================
+# Ambiente: DEV — barato e verboso. RAG ligado com LanceDB local (sem infra
+# extra), debug e conteúdo de chunk no trace ligados (ambiente controlado).
+# =============================================================================
+[dev.global.parameters]
+stack_name = "suporte-sla-fallback-dev"
+
+[dev.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+region = "us-east-1"
+parameter_overrides = [
+  "AppEnv=dev",
+  "ModelProviderOrder=openai,groq",
+  "LlmTotalTimeout=25",
+  "RagEnabled=true",
+  "RagVectorDb=lancedb",
+  "RagSearchType=hybrid",
+  "RagLancedbUri=/tmp/lancedb",
+  "RagTracingEnabled=true",
+  "RagMetricsEnabled=true",
+  "RagTraceContent=true",
+  "RagSampleRate=1.0",
+  "AgentDbBackend=dynamodb",
+  "AgentMemoryEnabled=true",
+  "AgentDdbSessionTable=suporte-sla-sessions-dev",
+  "AgentDdbMemoryTable=suporte-sla-memories-dev",
+  # ADOT layer (OTel -> X-Ray) para cobrir o trace do AGENTE Agno no X-Ray.
+  # CONFIRME o ARN para a sua regiao (us-east-1) e arquitetura (x86_64/arm64) e
+  # versao na doc oficial da ADOT antes do deploy — ARNs mudam por regiao/versao.
+  "AdotLayerArn=arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:1",
+]
+
+# =============================================================================
+# Ambiente: STAGING — próximo de produção. RAG com PgVector (RDS/Aurora); DSN
+# injetada no deploy (não versionada). Amostragem intermediária.
+# =============================================================================
+[staging.global.parameters]
+stack_name = "suporte-sla-fallback-staging"
+
+[staging.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+region = "us-east-1"
+parameter_overrides = [
+  "AppEnv=staging",
+  "ModelProviderOrder=openai,groq",
+  "LlmTotalTimeout=25",
+  "RagEnabled=true",
+  "RagVectorDb=pgvector",
+  "RagSearchType=hybrid",
+  # RagPgDsn: injete no deploy — NUNCA versione a DSN real aqui.
+  #   sam deploy --config-env staging --parameter-overrides "RagPgDsn=$RAG_PG_DSN"
+  "RagTracingEnabled=true",
+  "RagMetricsEnabled=true",
+  "RagTraceContent=false",
+  "RagSampleRate=0.25",
+  "AgentDbBackend=dynamodb",
+  "AgentMemoryEnabled=true",
+  "AgentDdbSessionTable=suporte-sla-sessions-staging",
+  "AgentDdbMemoryTable=suporte-sla-memories-staging",
+  # ADOT layer (OTel -> X-Ray). Confirme ARN por regiao/arquitetura/versao.
+  "AdotLayerArn=arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:1",
+]
+
+# =============================================================================
+# Ambiente: PROD — enxuto e seguro. RAG com S3Vectors (AWS-native, custo baixo em
+# escala); sem changeset interativo; conteúdo de chunk NUNCA no trace; amostragem
+# baixa para conter custo de tracing.
+# =============================================================================
+[prod.global.parameters]
+stack_name = "suporte-sla-fallback-prod"
+
+[prod.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+region = "us-east-1"
+parameter_overrides = [
+  "AppEnv=production",
+  "ModelProviderOrder=openai,groq",
+  "LlmTotalTimeout=25",
+  "RagEnabled=true",
+  "RagVectorDb=s3vectors",
+  "RagSearchType=hybrid",
+  # RagS3VectorBucket: nome do bucket/índice de vetores do S3 Vectors.
+  "RagS3VectorBucket=suporte-sla-fallback-vectors-prod",
+  "RagTracingEnabled=true",
+  "RagMetricsEnabled=true",
+  "RagTraceContent=false",
+  "RagSampleRate=0.1",
+  "AgentDbBackend=dynamodb",
+  "AgentMemoryEnabled=true",
+  "AgentDdbSessionTable=suporte-sla-sessions-prod",
+  "AgentDdbMemoryTable=suporte-sla-memories-prod",
+  # ADOT layer (OTel -> X-Ray). Confirme ARN por regiao/arquitetura/versao.
+  "AdotLayerArn=arn:aws:lambda:us-east-1:901920570463:layer:aws-otel-python-amd64-ver-1-32-0:1",
+]

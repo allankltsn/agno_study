@@ -76,6 +76,115 @@ Parameters:
       produção, aponte para o collector local da ADOT layer (ex.:
       http://localhost:4317) para encaminhar os spans OTel ao X-Ray. Vazio
       desabilita a exportação sem interromper a execução (Req 16.2).
+  AdotLayerArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN da AWS Distro for OpenTelemetry (ADOT) Lambda Layer, por ambiente. É o
+      que faz os spans OTel do AGENTE Agno chegarem ao X-Ray (o `Tracing: Active`
+      sozinho cobre só Lambda + API Gateway). Vazio = ADOT desligada (só trace de
+      infra). O ARN muda por região E arquitetura (arm64/x86); defina em
+      parameter_overrides do samconfig por ambiente, nunca fixo aqui.
+
+  # --- RAG / Knowledge (plugável por env, modular por ambiente de deploy) -----
+  # Estes parâmetros deixam o RAG configurável por ambiente SEM editar o template:
+  # cada ambiente (dev/staging/prod) sobrescreve os valores via samconfig.toml
+  # (parameter_overrides). O código do agente lê tudo por env var (config.py).
+  RagEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Liga/desliga o RAG (RAG_ENABLED). Desligado, o agente roda sem base.
+  RagVectorDb:
+    Type: String
+    Default: lancedb
+    AllowedValues: [lancedb, pgvector, s3vectors]
+    Description: >
+      Backend do vector DB (RAG_VECTOR_DB). Em produção serverless, s3vectors
+      (AWS-native) ou pgvector (RDS/Aurora) costumam fazer mais sentido que o
+      lancedb local. Ver skill agno-knowledge-rag.
+  RagSearchType:
+    Type: String
+    Default: hybrid
+    AllowedValues: [vector, keyword, hybrid]
+    Description: Tipo de busca no vector DB (RAG_SEARCH_TYPE).
+  RagTableName:
+    Type: String
+    Default: suporte
+    Description: Nome da tabela/coleção de vetores (RAG_TABLE_NAME).
+  RagEmbedderId:
+    Type: String
+    Default: text-embedding-3-small
+    Description: Id do modelo de embeddings (RAG_EMBEDDER_ID).
+  RagLancedbUri:
+    Type: String
+    Default: data/lancedb
+    Description: Diretório do índice LanceDB (RAG_LANCEDB_URI); em Lambda, use /tmp ou EFS.
+  RagPgDsn:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >
+      DSN de conexão do PgVector (RAG_PG_DSN). SEGREDO — nunca comitar valor real;
+      injete via parameter_overrides no deploy ou, de preferência, resolva de
+      Secrets Manager. NoEcho evita exibir o valor nos eventos do CloudFormation.
+  RagS3VectorBucket:
+    Type: String
+    Default: ""
+    Description: Bucket/índice do S3 Vectors (RAG_S3_VECTOR_BUCKET) quando s3vectors.
+  RagTracingEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Liga os spans de retrieval do RAG (RAG_TRACING_ENABLED).
+  RagMetricsEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Liga as métricas de retrieval do RAG (RAG_METRICS_ENABLED).
+  RagTraceContent:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Inclui o texto dos chunks no span (RAG_TRACE_CONTENT). Mantenha "false" em
+      produção — o conteúdo pode conter PII. Ligue apenas em dev.
+  RagSampleRate:
+    Type: String
+    Default: "0.1"
+    Description: Amostragem dos spans de retrieval em produção (RAG_SAMPLE_RATE).
+
+  # --- Persistência: memory & sessions (DynamoDB por padrão, modular por env) --
+  AgentDbBackend:
+    Type: String
+    Default: dynamodb
+    AllowedValues: [dynamodb, sqlite]
+    Description: >
+      Backend do Db do agente (AGENT_DB_BACKEND). DynamoDB é o padrão do projeto
+      para memory & sessions; sqlite é fallback local (não recomendado em Lambda,
+      cujo disco é efêmero).
+  AgentMemoryEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Liga a memória de usuário (AGENT_MEMORY_ENABLED). Sessions sempre on.
+  AgentDdbSessionTable:
+    Type: String
+    Default: suporte-sla-sessions
+    Description: Tabela DynamoDB de sessions (AGENT_DDB_SESSION_TABLE). Criada pelo Agno.
+  AgentDdbMemoryTable:
+    Type: String
+    Default: suporte-sla-memories
+    Description: Tabela DynamoDB de memories (AGENT_DDB_MEMORY_TABLE). Criada pelo Agno.
+
+# -----------------------------------------------------------------------------
+# Conditions: habilitam recursos opcionais por ambiente sem duplicar o template.
+# -----------------------------------------------------------------------------
+Conditions:
+  # ADOT ligada só quando um ARN de layer foi informado (por ambiente). Quando
+  # vazia, o trace de infra (Lambda/API Gateway via `Tracing: Active`) continua,
+  # mas os spans do agente Agno NÃO são encaminhados ao X-Ray.
+  UseAdot: !Not [!Equals [!Ref AdotLayerArn, ""]]
 
 # -----------------------------------------------------------------------------
 # Globals: padrões aplicados a todas as funções Serverless deste template.
@@ -143,13 +252,11 @@ Resources:
       Handler: suporte.interface.api.main.handler
       Layers:
         - !Ref DependenciasLayer
-        # NOTA (ADOT / OTel -> X-Ray): para encaminhar o tracing OpenTelemetry do
-        # Agno ao X-Ray em produção, anexe também a AWS Distro for OpenTelemetry
-        # (ADOT) Lambda layer aqui, ex.:
-        #   - arn:aws:lambda:<region>:901920570463:layer:aws-otel-python-amd64-ver-1-x-x:1
-        # e defina OTEL_EXPORTER_OTLP_ENDPOINT (abaixo) para o collector local da
-        # ADOT layer (http://localhost:4317). O ARN exato depende da região e da
-        # versão; consulte a documentação da ADOT. (Req 16.1)
+        # ADOT layer (OTel -> X-Ray) anexada só quando AdotLayerArn foi informado
+        # por ambiente (Condition UseAdot). É o que faz os spans do AGENTE Agno
+        # chegarem ao X-Ray; sem ela, `Tracing: Active` cobre só Lambda/API Gateway.
+        # O ARN muda por região/arquitetura — vem do samconfig por ambiente. (Req 16.1)
+        - !If [UseAdot, !Ref AdotLayerArn, !Ref "AWS::NoValue"]
       Environment:
         Variables:
           # Ambiente e debug (Req 16.6/16.7).
@@ -161,9 +268,71 @@ Resources:
           LLM_TOTAL_TIMEOUT: !Ref LlmTotalTimeout
           LLM_MAX_ATTEMPTS: !Ref LlmMaxAttempts
           LLM_BACKOFF_BASE: !Ref LlmBackoffBase
-          # Endpoint OTLP do tracing (Req 16.1). Aponte para o collector da ADOT
-          # layer em produção; vazio desabilita a exportação sem interromper.
-          OTEL_EXPORTER_OTLP_ENDPOINT: !Ref OtelExporterOtlpEndpoint
+          # Endpoint OTLP do tracing (Req 16.1). Com a ADOT ligada, aponta para o
+          # collector local da própria layer (localhost:4317), que encaminha os
+          # spans do Agno ao X-Ray. Sem ADOT, usa o valor do parâmetro (vazio
+          # desabilita a exportação sem interromper).
+          OTEL_EXPORTER_OTLP_ENDPOINT: !If [UseAdot, "http://localhost:4317", !Ref OtelExporterOtlpEndpoint]
+          # Exec wrapper da ADOT: auto-instrumenta o runtime e sobe o collector da
+          # layer. Só definido quando a ADOT está ligada (Condition UseAdot).
+          AWS_LAMBDA_EXEC_WRAPPER: !If [UseAdot, "/opt/otel-instrument", !Ref "AWS::NoValue"]
+          # Nome do serviço nos spans (aparece no X-Ray/OTel).
+          OTEL_SERVICE_NAME: suporte-sla-fallback
+          # RAG / Knowledge por env (plugável por ambiente via parameter_overrides
+          # no samconfig.toml). Trocar backend/toggles aqui NÃO altera o código.
+          RAG_ENABLED: !Ref RagEnabled
+          RAG_VECTOR_DB: !Ref RagVectorDb
+          RAG_SEARCH_TYPE: !Ref RagSearchType
+          RAG_TABLE_NAME: !Ref RagTableName
+          RAG_EMBEDDER_ID: !Ref RagEmbedderId
+          RAG_LANCEDB_URI: !Ref RagLancedbUri
+          RAG_PG_DSN: !Ref RagPgDsn
+          RAG_S3_VECTOR_BUCKET: !Ref RagS3VectorBucket
+          # Observabilidade de RAG (toggles por env; ver skill agno-observability).
+          RAG_TRACING_ENABLED: !Ref RagTracingEnabled
+          RAG_METRICS_ENABLED: !Ref RagMetricsEnabled
+          RAG_TRACE_CONTENT: !Ref RagTraceContent
+          RAG_SAMPLE_RATE: !Ref RagSampleRate
+          # Persistência: memory & sessions (DynamoDB por padrão). O Agno lê estas
+          # vars e cria as tabelas no primeiro uso; a policy DynamoDB abaixo
+          # concede as permissões mínimas. AWS_ENDPOINT_URL fica vazio em prod
+          # (AWS real); AWS_REGION vem do runtime do Lambda.
+          AGENT_DB_BACKEND: !Ref AgentDbBackend
+          AGENT_MEMORY_ENABLED: !Ref AgentMemoryEnabled
+          AGENT_DDB_SESSION_TABLE: !Ref AgentDdbSessionTable
+          AGENT_DDB_MEMORY_TABLE: !Ref AgentDdbMemoryTable
+      # IAM least-privilege para o DynamoDb do Agno (memory & sessions). O Agno
+      # cria as tabelas e seus GSIs no primeiro uso, então além de leitura/escrita
+      # precisa de Create/Describe/UpdateTable. As ações são restritas às tabelas
+      # de session/memory (e seus índices `index/*`), não a "*". Se preferir criar
+      # as tabelas fora da app (IaC), remova as permissões de Create/UpdateTable.
+      Policies:
+        # X-Ray: envio de segmentos (nível 1, `Tracing: Active`) e dos spans do
+        # agente Agno encaminhados pela ADOT layer (nível 2). Necessária sempre que
+        # há tracing em produção.
+        - AWSXRayDaemonWriteAccess
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:CreateTable
+                - dynamodb:DescribeTable
+                - dynamodb:UpdateTable
+                - dynamodb:UpdateTimeToLive
+                - dynamodb:DescribeTimeToLive
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:BatchGetItem
+                - dynamodb:BatchWriteItem
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource:
+                - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AgentDdbSessionTable}"
+                - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AgentDdbSessionTable}/index/*"
+                - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AgentDdbMemoryTable}"
+                - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AgentDdbMemoryTable}/index/*"
       # Eventos do API Gateway: publica a MESMA app FastAPI atrás do gateway
       # (Req 14.4). A rota "proxy" encaminha qualquer método/caminho para o
       # Mangum, que roteia internamente (/chat, /chat/stream, /health, docs).
