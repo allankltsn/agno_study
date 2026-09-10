@@ -1,6 +1,6 @@
 ---
 name: agno-testing-strategy
-description: Estrategia de testes automatizados e e2e para agentes Agno v2 - as tres camadas de teste (transporte deterministico, comportamento do agente, sistema real), eficiencia operacional (latencia/tokens/fallback como assercao sobre o log estruturado), eval de eficacia com golden set e scorers (deterministico + LLM-as-judge), resiliencia deterministica (timeout/retry/fallback com clock e adapters fake), harness em pytest, marcadores e pipeline de CI. Use ao escrever, organizar ou revisar testes de qualquer agente Agno do workspace (CLI, FastAPI, Lambda, AgentOS).
+description: Estrategia de testes automatizados, e2e, eval e OTIMIZACAO para agentes Agno v2 - as tres camadas de teste (transporte deterministico, comportamento do agente, sistema real), eficiencia operacional (latencia/tokens/fallback como assercao sobre o log estruturado), eval de eficacia com golden set e scorers (deterministico + LLM-as-judge), resiliencia deterministica (timeout/retry/fallback com clock e adapters fake), harness em pytest, marcadores e pipeline de CI, ALEM de busca e otimizacao automatica de parametros/modelos/prompt (Optuna para hiperparametros de sampling e RAG, DSPy para prompt/few-shot, promptfoo e Ragas para comparacao e eval de RAG, roteamento de modelos por custo/qualidade), com holdout, orcamento de trials e cache para evitar overfit e custo. Use ao escrever, organizar, revisar ou OTIMIZAR testes/qualidade de qualquer agente Agno do workspace (CLI, FastAPI, Lambda, AgentOS).
 ---
 
 # Estrategia de testes para agentes Agno (unidade, e2e e eval)
@@ -13,7 +13,17 @@ API Gateway e AgentOS.
 Le junto de `agno-observability` (o log estruturado e a base das assercoes de eficiencia),
 `agno-project-architecture-solid` (as camadas ports & adapters que tornam o agente
 testavel) e `agno-agentos-eval-deploy` (inspecao manual de traces/sessions na UI, que este
-guia automatiza).
+guia automatiza). Para a parte de **otimizacao**, conecta com `agno-prompt-system` (a
+instrucao e a variavel de maior impacto), `agno-providers` (todo parametro do modelo e
+configuravel por env var - e exatamente isso que o otimizador varia), `agno-knowledge-rag`
+(parametros de retrieval que tambem entram na busca) e `agno-secrets` (chaves resolvidas
+por env/Secrets Manager que a funcao objetivo consome sem hardcode).
+
+> **Como usar esta skill.** Ela tem duas metades. A primeira (ate "Eval de eficacia")
+> ensina a **medir** o agente com gates objetivos. A segunda ("Otimizacao e busca de
+> parametros, modelos e prompt") ensina a **melhorar** o agente automaticamente por cima
+> dessa medicao. A regra e inviolavel: **so otimize o que voce ja sabe medir.** Sem golden
+> set + scorers confiaveis, qualquer "otimizacao" e ruido caro.
 
 ## Principio central: separe "eficiencia" em tres sentidos
 
@@ -351,6 +361,279 @@ def test_recall_de_out_of_scope():
 - Registre cada execucao (CSV/JSON com data, modelo, acuracia, p95). O valor do eval e ver
   a **regressao** ao trocar modelo/prompt/`provider_order`, nao o pass/fail isolado.
 
+## Otimizacao e busca de parametros, modelos e prompt
+
+Ate aqui a skill mede o agente. Esta secao usa essa medicao como **funcao objetivo** para
+melhorar o agente de forma sistematica, em vez de ajustar `temperature` no olho. A tese e
+simples: **um agente tem parametros, e parametros se otimizam contra uma metrica.** Mas
+otimizacao de LLM tem armadilhas proprias (custo por trial, nao-determinismo, overfit no
+golden set) que a maioria dos tutoriais ignora. Trate esta secao como o guia para fazer
+isso sem se enganar.
+
+### O que da (e o que nao da) para otimizar
+
+Separe os "parametros" por natureza - cada grupo pede uma ferramenta diferente. Misturar
+tudo num otimizador so e o erro classico.
+
+| Grupo | Exemplos | Ferramenta indicada | Custo por trial |
+|-------|----------|---------------------|-----------------|
+| **Sampling** | `temperature`, `top_p`, `top_k`, `max_tokens` | Optuna (TPE) | N chamadas LLM |
+| **RAG / retrieval** | `top_k`, chunk size, overlap, threshold de similaridade, reranker on/off | Optuna + Ragas | N chamadas + indexacao |
+| **Prompt / instrucao / few-shot** | texto do system prompt, exemplos, formato de saida | DSPy (MIPROv2/GEPA) ou promptfoo | alto (busca sobre candidatos) |
+| **Modelo / roteamento** | provider primario, ordem de fallback, modelo por faixa de custo | promptfoo (matriz) + roteador | N x M (modelos x casos) |
+| **Orquestracao** | `per_attempt_timeout_s`, `total_timeout_s`, `max_attempts`, `backoff_base_s` | Optuna (multi-objetivo) | N chamadas |
+
+Regra de escopo: **prompt e o de maior impacto, sampling e o mais barato de varrer, modelo
+e o de maior alavanca de custo.** Se so puder atacar um, comece pelo prompt.
+
+### Pre-requisito absoluto: a funcao objetivo
+
+Todo otimizador precisa de uma funcao `params -> score` estavel. Ela reaproveita o golden
+set e os scorers ja definidos. Um ponto de arquitetura que este workspace ja facilita:
+**cada parametro do agente e configurado por env var** (ver `agno-providers`,
+`agno-secrets`). Entao o otimizador nao precisa conhecer o codigo do agente - ele so injeta
+valores nas envs, reconstroi o agente pelo `composition_root` e mede.
+
+```python
+# tests/optimization/objective.py
+import os, statistics
+from suporte.composition_root import build_answer_question
+from suporte.application.dto import AnswerRequest
+from tests.eval.scorers import score_deterministic
+
+def evaluate(params: dict, cases: list[dict]) -> dict:
+    """Contrato unico: aplica params por env var, roda o golden set, devolve metricas.
+    Nunca faz hardcode de segredo; so mexe em parametros de comportamento."""
+    for key, value in params.items():
+        os.environ[key] = str(value)          # ex.: MODEL_TEMPERATURE, RAG_TOP_K
+
+    uc = build_answer_question()              # reconstroi com os params atuais
+    latencies, passed = [], 0
+    for case in cases:
+        resp = uc.execute(AnswerRequest(case["question"]))
+        passed += int(score_deterministic(case, resp))
+        latencies.append(resp.latency_ms)
+
+    return {
+        "accuracy": passed / len(cases),
+        "p95_latency_ms": _p95(latencies),
+        "avg_tokens": statistics.mean(...),   # do log estruturado
+    }
+```
+
+Essa funcao e a fronteira. Optuna, DSPy e promptfoo sao apenas motores diferentes que a
+chamam. Se `evaluate` estiver instavel (varia muito entre execucoes iguais), **pare e
+conserte antes de otimizar** - senao voce otimiza ruido.
+
+### Overfit e honestidade: holdout obrigatorio
+
+O erro numero um em otimizacao de LLM: rodar 200 trials no golden set inteiro, escolher o
+melhor e comemorar. Voce so aprendeu a decorar aquele conjunto. Separe **sempre** tres
+particoes, como em ML classico:
+
+- **train/dev** (~60%): o otimizador ve e otimiza contra este.
+- **validation** (~20%): usado para escolher entre os melhores candidatos e detectar
+  overfit (se train sobe e validation cai, parou de generalizar).
+- **holdout/test** (~20%): **o otimizador NUNCA ve.** So e tocado uma vez, no fim, para
+  reportar o numero honesto. Se voce olhou o holdout e voltou a otimizar, ele virou
+  validation e voce perdeu a medida honesta.
+
+Fixe a particao por hash do `id` do caso (deterministico, reproduzivel entre execucoes),
+nao por `random.shuffle` sem seed.
+
+### Optuna - busca de sampling, RAG e orquestracao
+
+[Optuna](https://optuna.readthedocs.io/en/stable/) e o padrao em Python para busca
+"define-by-run": voce escreve uma funcao `objective(trial)` que pede cada parametro ao
+`trial` e devolve o score. O sampler default (TPE, Tree-structured Parzen Estimator)
+aprende com os trials anteriores e concentra a busca nas regioes promissoras - muito melhor
+que grid/random para orcamento pequeno. Conteudo tecnico condensado das
+[docs oficiais do Optuna](https://optuna.readthedocs.io/) e rephrased para conformidade.
+
+```python
+# tests/optimization/optimize_sampling.py
+import optuna
+from tests.optimization.objective import evaluate
+from tests.optimization.dataset import load_split   # train/validation/holdout por hash
+
+def objective(trial: optuna.Trial) -> float:
+    params = {
+        "MODEL_TEMPERATURE": trial.suggest_float("temperature", 0.0, 1.0),
+        "MODEL_TOP_P":       trial.suggest_float("top_p", 0.5, 1.0),
+        "MODEL_MAX_TOKENS":  trial.suggest_int("max_tokens", 256, 2048, step=128),
+        "RAG_TOP_K":         trial.suggest_int("rag_top_k", 2, 8),
+    }
+    metrics = evaluate(params, load_split("train"))
+
+    # Pruning: aborta trials ruins cedo para nao gastar chamadas de LLM.
+    trial.report(metrics["accuracy"], step=0)
+    if trial.should_prune():
+        raise optuna.TrialPruned()
+
+    return metrics["accuracy"]
+
+def main() -> None:
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),          # reproduzivel
+        pruner=optuna.pruners.MedianPruner(),
+        storage="sqlite:///tests/optimization/study.db",       # retomavel e auditavel
+        study_name="sampling-v1",
+        load_if_exists=True,
+    )
+    study.optimize(objective, n_trials=40, timeout=3600)       # ORCAMENTO explicito
+
+    print("melhor score (train):", study.best_value)
+    print("melhores params:", study.best_params)
+    # valida no holdout UMA vez, com os melhores params:
+    print("holdout:", evaluate(study.best_params, load_split("holdout")))
+```
+
+Boas praticas de Optuna para agentes LLM:
+
+- **Sempre defina orcamento** (`n_trials` E `timeout`). Cada trial dispara N chamadas de
+  LLM; sem teto, a conta explode. Comece com 20-40 trials.
+- **Ative pruning** (`MedianPruner`, `HyperbandPruner`) para matar trials ruins cedo.
+- **Use `storage` sqlite**: o study fica retomavel (roda em pedacos) e auditavel depois.
+- **Fixe `seed` no sampler** para reproducibilidade - mas lembre que o LLM ainda tem
+  variancia propria; rode a funcao objetivo com `temperature` baixa no eval.
+- **Multi-objetivo quando ha trade-off** (qualidade x latencia x custo): use
+  `directions=["maximize", "minimize"]` e analise a **fronteira de Pareto**, nao um numero
+  so. Nao existe "melhor" absoluto quando custo importa.
+
+```python
+# multi-objetivo: qualidade vs custo (fronteira de Pareto)
+def objective_multi(trial):
+    params = {...}
+    m = evaluate(params, load_split("train"))
+    return m["accuracy"], m["avg_tokens"]        # maximizar acuracia, minimizar tokens
+
+study = optuna.create_study(directions=["maximize", "minimize"],
+                            sampler=optuna.samplers.NSGAIISampler(seed=42))
+```
+
+### Cache: o que torna a busca viavel
+
+Sem cache, 40 trials x 50 casos = 2000 chamadas de LLM por rodada. Duas defesas:
+
+1. **Cache de respostas do LLM na busca**: chaveie por `(prompt, params_de_sampling)`. Se
+   o par ja foi visto, reutilize. Isso corta drasticamente o custo de re-execucoes.
+2. **Ollama local durante a busca** (`agno-local-dev-environment`): custo zero, itere a
+   vontade; confirme o vencedor no provider real so no fim. Trocar e mudar
+   `MODEL_PROVIDER_ORDER` - a `LLMPort` e a mesma.
+
+Cuidado: cache mascara a **latencia real**. Se o objetivo inclui p95, meca latencia sem
+cache (ou com um fake de `delay_s` conhecido) para nao otimizar contra um numero irreal.
+
+### DSPy - otimizacao automatica de prompt e few-shot
+
+Quando a variavel e o **texto do prompt**, o motor certo e o [DSPy](https://dspy.ai/): ele
+trata a instrucao e os exemplos few-shot como parametros e "compila" o programa contra uma
+metrica, propondo e testando candidatos automaticamente. Escolha do otimizador (resumido da
+[documentacao do DSPy](https://dspy.ai/diving-deeper/choosing-an-optimizer/), rephrased para
+conformidade):
+
+- **`BootstrapFewShot`**: gera exemplos few-shot a partir do seu dataset. Barato, bom ponto
+  de partida com poucos dados.
+- **`MIPROv2`**: otimiza instrucao E few-shot em conjunto via busca bayesiana. Mais caro,
+  ganha em tarefas complexas.
+- **`GEPA`**: otimizador reflexivo (le o feedback textual da metrica e propoe melhorias
+  mantendo uma fronteira de Pareto); recomendado para workloads complexos.
+
+```python
+# tests/optimization/optimize_prompt.py
+import dspy
+
+dspy.configure(lm=dspy.LM("ollama/llama3", api_base="http://localhost:11434"))
+
+class Suporte(dspy.Signature):
+    """Responde duvidas de suporte fundamentado na doc; escala fora de escopo."""
+    question: str = dspy.InputField()
+    answer: str = dspy.OutputField()
+    escalate: bool = dspy.OutputField()
+
+program = dspy.Predict(Suporte)
+
+def metric(example, pred, trace=None) -> float:
+    # reusa a mesma logica de scorer do eval (deterministico + judge como sinal)
+    return 1.0 if _matches(example, pred) else 0.0
+
+optimizer = dspy.MIPROv2(metric=metric, auto="light")   # "light" = orcamento menor
+compiled = optimizer.compile(program, trainset=load_split("train"),
+                             valset=load_split("validation"))
+compiled.save("tests/optimization/compiled_prompt.json")
+```
+
+O prompt otimizado que o DSPy produz e um **artefato versionavel**. No workspace, a fonte de
+verdade do prompt fica em bucket S3 com fallback local (`agno-prompt-system`): promova o
+prompt compilado para la depois de validado no holdout, com a metrica que justificou a
+troca registrada.
+
+### promptfoo - comparacao de modelos e prompts em matriz
+
+Para **decidir entre modelos** ou variacoes de prompt de forma visual e versionada,
+[promptfoo](https://www.promptfoo.dev/docs/configuration/guide) roda cada prompt contra cada
+caso e monta uma matriz de comparacao (rephrased da doc oficial para conformidade). Ideal na
+fase de escolha, e roda em CI.
+
+```yaml
+# tests/optimization/promptfooconfig.yaml
+providers:
+  - openai:gpt-4o-mini
+  - groq:llama-3.3-70b-versatile
+  - ollama:chat:llama3
+prompts:
+  - file://prompts/v1.txt
+  - file://prompts/v2.txt
+tests:
+  - vars: { question: "Como reseto minha senha?" }
+    assert:
+      - type: icontains
+        value: "configuracoes"
+      - type: llm-rubric              # LLM-as-judge com threshold (default 0.7)
+        value: "Responde fundamentado e nao inventa politica inexistente"
+```
+
+Rode com `npx promptfoo eval` e compare custo/latencia/qualidade lado a lado. Trate o
+`llm-rubric` como sinal (LLM-as-judge), nao verdade absoluta - vale a mesma ressalva do
+eval de eficacia.
+
+### Ragas - eval especifico de RAG
+
+Se o agente usa RAG (`agno-knowledge-rag`), a qualidade nao e so "resposta certa": e
+**faithfulness** (a resposta se sustenta no contexto recuperado?), **context precision** e
+**context recall**. [Ragas](https://docs.ragas.io/) mede essas dimensoes e ate integra com
+o otimizador do DSPy para melhorar os prompts das metricas. Use Ragas para decidir os
+parametros de retrieval (`RAG_TOP_K`, chunk size, reranker) que voce varre no Optuna - a
+metrica de faithfulness vira o `score` da funcao objetivo.
+
+### Fluxo recomendado (do barato ao caro)
+
+```
+1. Eval confiavel  ──►  golden set + scorers + holdout separado   (pre-requisito)
+2. Sampling        ──►  Optuna (TPE, pruning, Ollama, cache)       (barato, rapido)
+3. RAG             ──►  Optuna + Ragas (faithfulness/recall)       (medio)
+4. Prompt          ──►  DSPy (BootstrapFewShot -> MIPROv2/GEPA)    (alto impacto)
+5. Modelo          ──►  promptfoo (matriz custo x qualidade)       (decisao de arquitetura)
+6. Validar no HOLDOUT uma vez  ──►  promover artefato + registrar a metrica que justificou
+```
+
+Cada etapa so avanca se a anterior estabilizou. E cada promocao (prompt novo, modelo novo,
+`provider_order` novo) entra como uma linha no historico de eval - assim voce mede a
+**regressao** na proxima mudanca, nao so o ganho pontual.
+
+### Anti-padroes de otimizacao (o que NAO fazer)
+
+- **Otimizar sem holdout.** Voce so vai decorar o golden set e o ganho nao generaliza.
+- **Sem orcamento de trials.** A conta de tokens explode silenciosamente.
+- **Otimizar contra o LLM-as-judge como verdade.** O juiz tem vies; valide-o contra casos
+  rotulados a mao antes de confiar. Prefira scorer deterministico como metrica principal.
+- **Cache mascarando latencia.** Nao otimize p95 com respostas cacheadas.
+- **Mudar varios grupos de uma vez** (prompt + modelo + sampling juntos). Voce nao sabe o
+  que causou o ganho/regressao. Otimize um grupo, fixe, passe ao proximo.
+- **Confundir eval de PR com otimizacao.** Otimizacao e cara e roda offline/nightly, NUNCA
+  no gate que bloqueia commit.
+
 ## Observabilidade como saida testavel
 
 O log e o trace sao saida que voce asserta (conecta com `agno-observability`):
@@ -400,14 +683,19 @@ Marque por velocidade/dependencia em `pyproject.toml`:
 markers = [
     "e2e: comportamento com LLM real/Ollama (lento, nao-deterministico)",
     "system: smoke contra deploy real (LocalStack/AWS)",
+    "optimization: busca/otimizacao de parametros/modelo/prompt (caro, offline)",
 ]
 ```
 
-- **Gate de PR (rapido, deterministico):** `uv run pytest -m "not e2e and not system"`.
+- **Gate de PR (rapido, deterministico):** `uv run pytest -m "not e2e and not system and not optimization"`.
   Camada 1 + resiliencia + eficiencia operacional com fake + observabilidade. Bloqueia merge.
 - **Nightly:** `uv run pytest -m e2e` com Ollama. Eval de eficacia + eficiencia real. Nao
   bloqueia PR; alerta em regressao.
 - **Pre-release:** `-m e2e` com provider real + `-m system` contra LocalStack/AWS.
+- **Otimizacao (sob demanda, offline):** scripts em `tests/optimization/` (Optuna, DSPy,
+  promptfoo). NUNCA no gate de PR - sao caros e nao-deterministicos. Rode manualmente ou em
+  um workflow dedicado; o resultado e um artefato promovido (prompt/params/modelo) mais uma
+  linha no historico de eval, nao um pass/fail.
 
 ## Cuidados com o nao-determinismo (honestidade)
 
@@ -437,6 +725,13 @@ tests/
 │   ├── scorers.py                 # deterministico + LLM-as-judge
 │   ├── test_agent_quality.py      # @pytest.mark.e2e (Ollama/real)
 │   └── test_operational_efficiency.py  # p95, tokens, taxa de fallback
+├── optimization/                  # busca/otimizacao (offline, caro; nao roda no PR)
+│   ├── dataset.py                 # split train/validation/holdout por hash do id
+│   ├── objective.py               # funcao params -> score (reusa scorers do eval)
+│   ├── optimize_sampling.py       # Optuna: temperature/top_p/max_tokens/RAG_TOP_K
+│   ├── optimize_prompt.py         # DSPy: instrucao + few-shot (MIPROv2/GEPA)
+│   ├── promptfooconfig.yaml       # matriz de modelos x prompts
+│   └── study.db                   # storage retomavel/auditavel do Optuna
 └── system/
     └── test_smoke.py              # @pytest.mark.system (deploy real)
 ```
@@ -450,6 +745,9 @@ tests/
 5. Observabilidade (`request_id`, log unico, sem PII).
 6. `test_operational_efficiency.py` - budgets de latencia/tokens/fallback.
 7. So entao, num marcador separado, o eval de eficacia (Ollama) e o smoke (LocalStack).
+8. **Por ultimo, e so quando o eval estiver estavel**, a otimizacao (`tests/optimization/`):
+   funcao objetivo + holdout, depois Optuna (sampling/RAG), DSPy (prompt) e promptfoo
+   (modelo). Otimizar antes de medir bem e desperdicio de tokens.
 
 ## Checklist de testes (Definition of Done por projeto)
 
@@ -467,3 +765,16 @@ tests/
 - [ ] Smoke contra LocalStack/AWS antes do release.
 - [ ] Resultados de eval registrados ao longo do tempo (deteccao de regressao).
 - [ ] temperature baixa e thresholds com folga no ambiente de eval.
+
+### Otimizacao (quando for buscar parametros/modelo/prompt)
+
+- [ ] Funcao objetivo unica (`params -> score`) reusando os scorers do eval, injetando
+      params por env var (sem hardcode de segredo).
+- [ ] Split train/validation/**holdout** por hash do `id`; holdout tocado uma unica vez no fim.
+- [ ] Optuna com **orcamento** (`n_trials` + `timeout`), pruning e `storage` sqlite retomavel.
+- [ ] Multi-objetivo (Pareto) quando houver trade-off qualidade x latencia x custo.
+- [ ] Cache de LLM e/ou Ollama local na busca; latencia medida SEM cache.
+- [ ] DSPy para prompt/few-shot; prompt otimizado promovido como artefato versionado (S3/local).
+- [ ] promptfoo para decidir modelo (matriz custo x qualidade); Ragas para parametros de RAG.
+- [ ] Otimizacao roda offline/sob demanda (marcador `optimization`), NUNCA no gate de PR.
+- [ ] Um so grupo de parametros por rodada; ganho validado no holdout e registrado no historico.

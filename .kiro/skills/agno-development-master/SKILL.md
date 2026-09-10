@@ -43,6 +43,12 @@ e entender cada conceito de forma independente.
 | 10 | Avaliacao e AgentOS (API FastAPI, tracing, deploy AWS EC2) | `agno-agentos-eval-deploy` |
 | 11 | Deploy serverless: HTTP REST via Lambda + API Gateway (SAM, Layers) | `agno-lambda-apigateway` |
 | * | Observabilidade: tracing OTel, log estruturado, metricas (local + AWS) | `agno-observability` |
+| * | Secrets/config: pipe de fallback env -> Secrets Manager, fail fast | `agno-secrets` |
+| * | Prompt system: melhores praticas + especificidades por modelo | `agno-prompt-system` |
+| * | Providers: adicionar modelos (Gemini, Grok, Kimi K3, Bedrock), tudo por env + default | `agno-providers` |
+| * | Guardrails: baseline obrigatorio (PII/injection/moderation) + escopo + Bedrock | `agno-guardrails` |
+| * | Security: producao em 2 niveis (agente/LLM + REST API FastAPI), defense in depth | `agno-security` |
+| * | AWS: deploy via SAM (template, otimizacao de pacotes) + boto3 recomendado | `agno-aws` |
 
 ## Fluxo de trabalho ao criar um novo agente de estudo
 
@@ -58,11 +64,19 @@ e entender cada conceito de forma independente.
 - OpenAI - padrao das docs Agno (`OPENAI_API_KEY`).
 - Groq - rapido/barato para estudo (`GROQ_API_KEY`).
 - Ollama - modelos locais, sem chave/custo.
+- Google Gemini - `GOOGLE_API_KEY` (multimodal forte).
+- xAI Grok - `XAI_API_KEY`.
+- Moonshot Kimi K3 - `MOONSHOT_API_KEY` (raciocina por padrao).
+- AWS Bedrock - credenciais via cadeia AWS + regiao (sem `*_API_KEY`).
 
-Sempre deixe o provider configuravel por variavel de ambiente, nunca hardcoded.
+Sempre deixe o provider e o modelo configuraveis por variavel de ambiente, nunca
+hardcoded, e cada parametro do provider com default se a env faltar (ver skill
+`agno-providers`).
 
 ## Boas praticas transversais
 
+- Todo agente SEMPRE tem pelo menos um guardrail configurado (ver `agno-guardrails`);
+  um agente sem guardrail e considerado incompleto.
 - Nunca commitar segredos. Use `.env` + `.env.example`; adicione `.env` ao `.gitignore`.
 - Fixe versoes de dependencias (`agno==<versao>`), evitando ranges abertos.
 - Um `main.py` minimo e legivel por agente; logica reutilizavel em modulos pequenos.

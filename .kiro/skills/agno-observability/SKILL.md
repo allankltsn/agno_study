@@ -145,10 +145,27 @@ Observabilidade e preocupacao de **infraestrutura** - o dominio nao a conhece (v
 Promova os campos do seu log a **metricas** quando quiser alarmar: contador de fallback,
 histograma de `latency_ms` por provider, soma de tokens/custo.
 
-## Stack local (desenvolvimento)
+## Regra: onde cada backend roda (dev x producao)
 
-Como o Agno fala OTel, aponte o exporter para um coletor local em Docker. Escolha por
-objetivo:
+Decisao arquitetural fixa deste projeto:
+
+- **Producao = CloudWatch + X-Ray (AWS), obrigatoriamente.** Logs em CloudWatch
+  Logs, traces em X-Ray (via ADOT), metricas em CloudWatch (EMF) e alarmes em
+  CloudWatch Alarms. Este e o caminho produtivo suportado — nao ha alternativa.
+- **SigNoz / Grafana+Tempo+Loki+Prometheus / Langfuse sao SO de desenvolvimento
+  local.** Servem para inspecionar/estudar em Docker e **nunca** vao para
+  producao. Nao aponte um agente produtivo para esses backends.
+
+O que **nao** muda entre os dois: o codigo do agente. O Agno exporta OTel e emite
+log estruturado; trocar de destino (collector local -> X-Ray/CloudWatch) e so
+mudar a configuracao/variavel de ambiente do exporter. A escolha do backend e de
+infraestrutura/deploy, nao de codigo.
+
+## Stack local (SOMENTE desenvolvimento)
+
+Como o Agno fala OTel, aponte o exporter para um coletor local em Docker. Uso
+restrito a dev/estudo — nada aqui e destino de producao (ver regra acima). Escolha
+por objetivo:
 
 - **SigNoz** ou **Jaeger + OpenTelemetry Collector** - recebem spans OTLP; SigNoz cobre
   traces + tokens num painel so.
@@ -164,10 +181,12 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 export OTEL_SERVICE_NAME=suporte-sla-fallback
 ```
 
-## AWS (producao)
+## AWS (producao — CloudWatch + X-Ray, obrigatorio)
 
-Mapeamento dos tres sinais para servicos gerenciados. Em Lambda, casa com o padrao de
-`agno-lambda-apigateway` (SAM + API Gateway).
+Em producao a observabilidade e feita **exclusivamente** com servicos gerenciados
+da AWS: **CloudWatch** (logs e metricas) e **X-Ray** (traces). Em Lambda, casa com
+o padrao de `agno-lambda-apigateway` (SAM + API Gateway). Mapeamento dos tres
+sinais:
 
 ### Logs -> CloudWatch Logs
 
@@ -184,38 +203,78 @@ fields @timestamp, provider, latency_ms, used_fallback
 
 ### Traces -> X-Ray via ADOT
 
-- Use a **AWS Distro for OpenTelemetry (ADOT) Lambda Layer**. Como o Agno exporta OTLP,
-  o ADOT Collector (rodando como extension/layer) encaminha os spans para o X-Ray.
-- Ative `Tracing: Active` na funcao SAM (segmento da Lambda + API Gateway correlacionado
-  com os spans do Agno).
+X-Ray e SEMPRE o backend de traces em producao (apos o deploy). Mas atencao a uma
+distincao que muda o que voce precisa configurar — sao **dois niveis de trace**:
+
+1. **Trace de infraestrutura (o que `Tracing: Active` da sozinho).** Segmentos do
+   X-Ray para o **Lambda e o API Gateway**: cold start, duracao da invocacao,
+   erros. Isso NAO conhece o miolo do agente — nao sabe "chamou o OpenAI", "fez
+   fallback pro Groq" nem "buscou 5 chunks no RAG". E o contorno, nao o conteudo.
+2. **Trace do agente Agno (precisa ser ligado explicitamente).** O Agno e
+   instrumentado com **OpenTelemetry** e emite spans de modelo, tool, team,
+   workflow, tokens e latencia por span. Esses spans sao **OTLP**, e o X-Ray NAO
+   fala OTLP nativamente.
+
+> **Regra pratica:** `Tracing: Active` **sozinho NAO cobre o trace do agente
+> Agno** — cobre so Lambda + API Gateway. Para os spans internos do Agno chegarem
+> ao X-Ray e obrigatoria a **ADOT layer** (AWS Distro for OpenTelemetry) rodando
+> como extension no Lambda: ela recebe o OTLP do Agno e encaminha para o X-Ray.
+> Sem a ADOT, voce ve so o segmento do Lambda.
+
+Os **tres requisitos** para o X-Ray cobrir o trace do agente (todos necessarios):
+
+1. **Anexar a ADOT layer** (ARN correto por regiao E arquitetura arm64/x86).
+2. **`AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument`** e
+   **`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`** (o collector da propria
+   ADOT layer, no localhost do ambiente Lambda).
+3. **`AWSXRayDaemonWriteAccess`** na funcao (permissao de envio ao X-Ray).
+
+- Ative tambem `Tracing: Active` na funcao e `TracingEnabled: true` no API Gateway
+  (nivel 1), para correlacionar o contorno AWS com os spans do Agno (nivel 2).
 - Alternativa gerenciada mais nova: **CloudWatch Application Signals** (APM sobre OTel).
 - **Cuidado com Lambda:** o export por batch nao combina com o congelamento do container.
-  Use o ADOT Collector como extension ou force o flush dos spans ao fim do handler,
-  senao voce perde traces.
+  Use o ADOT Collector como extension (os requisitos acima ja fazem isso) ou force o
+  flush dos spans ao fim do handler, senao voce perde traces.
 
-Trecho de `template.yaml` (SAM):
+> **Fidelidade (honestidade):** o modelo de dados do X-Ray (segments/subsegments) e
+> mais pobre que o de um backend OTel dedicado. Atributos ricos de LLM (tokens,
+> custo, prompt/resposta por span) viram metadata/annotations e nem sempre ficam tao
+> navegaveis quanto no Langfuse/SigNoz (que sao SO de dev). Para producao unificada
+> com o resto da AWS, X-Ray atende; para inspecao profunda de LLM, e mais fraco.
+
+Trecho de `template.yaml` (SAM) — ADOT modular por ambiente (o ARN vem de
+parametro, pois muda por regiao/arquitetura; ver `samconfig.toml`):
 
 ```yaml
+Parameters:
+  AdotLayerArn:
+    Type: String
+    Default: ""     # vazio = ADOT desligada (so trace de infra); preencha por ambiente
+Conditions:
+  UseAdot: !Not [!Equals [!Ref AdotLayerArn, ""]]
 Globals:
   Function:
-    Tracing: Active                      # habilita X-Ray na funcao
+    Tracing: Active                      # nivel 1: X-Ray na funcao (Lambda)
 Resources:
   ChatAgentFunction:
     Type: AWS::Serverless::Function
     Properties:
       Layers:
-        # ARN da ADOT layer para a regiao/arquitetura corretas
-        - !Sub arn:aws:lambda:${AWS::Region}:901920570463:layer:aws-otel-python-arm64-ver-1-29-0:1
+        - !Ref DependenciasLayer
+        # nivel 2: ADOT so quando AdotLayerArn foi informado (por ambiente)
+        - !If [UseAdot, !Ref AdotLayerArn, !Ref "AWS::NoValue"]
       Environment:
         Variables:
-          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+          AWS_LAMBDA_EXEC_WRAPPER: !If [UseAdot, "/opt/otel-instrument", !Ref "AWS::NoValue"]
+          OTEL_EXPORTER_OTLP_ENDPOINT: !If [UseAdot, "http://localhost:4317", ""]
           OTEL_SERVICE_NAME: suporte-sla-fallback
       Policies:
         - AWSXRayDaemonWriteAccess       # permissao para enviar ao X-Ray
 ```
 
 > Confirme o ARN/versao da ADOT layer para a sua regiao e arquitetura (arm64/x86) na
-> documentacao oficial; ARNs mudam por regiao e versao.
+> documentacao oficial; ARNs mudam por regiao e versao. Defina-o por ambiente em
+> `parameter_overrides` (dev/staging/prod), nunca fixo no template.
 
 ### Metricas -> CloudWatch (EMF)
 
@@ -231,6 +290,60 @@ Resources:
 - **CloudWatch Alarms** em cima das metricas: alarme quando a taxa de fallback sobe,
   quando o p95 estoura o SLA (ex.: `total_timeout_s`), ou quando erros de provider
   disparam. E onde a observabilidade vira acao.
+
+## Observabilidade de RAG (retrieval)
+
+Quando o agente tem `knowledge` (ver `agno-knowledge-rag`), o **passo de retrieval**
+vira um alvo próprio de observabilidade — separado da chamada ao modelo. Duas
+perguntas: **o retrieval trouxe o certo?** (eficácia) e **quanto pesou?** (eficiência).
+
+Como tudo mais nesta skill, ligue/desligue por **variável de ambiente**, sem tocar no
+código do domínio (a instrumentação vive em `infrastructure`/`composition_root`):
+
+| Env var | Efeito |
+|---------|--------|
+| `RAG_TRACING_ENABLED` | liga os spans de retrieval (chunks recuperados, scores, latência da busca) |
+| `RAG_METRICS_ENABLED` | liga métricas de retrieval (hit rate, chunks/consulta, tokens de contexto) |
+| `RAG_TRACE_CONTENT` | inclui o **texto** dos chunks no span — **só em dev**; em prod vaza dados |
+| `RAG_SAMPLE_RATE` | amostragem dos spans de retrieval em prod (ex.: 0.1) |
+
+O que observar em cada sinal (específico de RAG):
+
+- **Traces** — um span por busca no vector DB: `rag.vector_db` (lancedb/pgvector/
+  s3vectors), `rag.search_type` (vector/keyword/hybrid), `rag.top_k`,
+  `rag.chunks_returned`, `rag.top_score`, `rag.latency_ms`. Correlacione com o
+  `request_id` (mesmo padrão de log↔trace abaixo).
+- **Logs** — um evento por consulta ao conhecimento: quantos chunks entraram no
+  contexto, tokens de contexto e se a resposta usou a base. Nunca logue o conteúdo
+  bruto do chunk em prod (pode conter PII); logue `doc_id`/`chunk_id` e um hash.
+- **Métricas** — `rag_hit_rate` (contra um golden set, ver `agno-testing-strategy`),
+  histograma de `rag_latency_ms` por `vector_db`, soma de `context_tokens`. Não use
+  `chunk_id`/`doc_id` como dimensão de métrica (alta cardinalidade) — vão no log/trace.
+
+```python
+# infrastructure/observability/tracing.py — span de retrieval (esboço)
+from opentelemetry import trace
+
+def trace_retrieval(*, vector_db: str, search_type: str, top_k: int,
+                    chunks_returned: int, top_score: float, latency_ms: float,
+                    include_content: bool = False, chunks: list[str] | None = None) -> None:
+    span = trace.get_current_span()
+    span.set_attribute("rag.vector_db", vector_db)
+    span.set_attribute("rag.search_type", search_type)
+    span.set_attribute("rag.top_k", top_k)
+    span.set_attribute("rag.chunks_returned", chunks_returned)
+    span.set_attribute("rag.top_score", round(top_score, 4))
+    span.set_attribute("rag.latency_ms", round(latency_ms, 1))
+    # RAG_TRACE_CONTENT só em dev: conteúdo do chunk pode conter PII.
+    if include_content and chunks:
+        span.set_attribute("rag.chunks_preview", " | ".join(c[:120] for c in chunks))
+```
+
+Onde visualizar localmente (ver `agno-local-dev-environment`): **AgentOS** mostra a
+tool call de busca por run; **Langfuse** é o melhor para tokens de contexto e conteúdo
+recuperado por span; **SigNoz/Grafana** para latência agregada do retrieval. Para
+eficácia (recall@k), rode o golden set com **Ragas/DeepEval** (ver
+`agno-testing-strategy`).
 
 ## Cuidados transversais
 
@@ -251,7 +364,10 @@ Resources:
 2. **AgentOS:** ligue `tracing=True` e inspecione traces/sessions pela UI.
 3. **Lambda:** adote **aws-lambda-powertools** (Logger/Metrics/Tracer) + **ADOT layer**
    para os spans OTel do Agno; ative `Tracing: Active` no `template.yaml`.
-4. **Producao:** sampling + redacao de PII + alarmes CloudWatch nos SLAs.
+4. **Producao (CloudWatch + X-Ray, obrigatorio):** logs em CloudWatch Logs, traces
+   em X-Ray (ADOT), metricas em CloudWatch (EMF) e alarmes CloudWatch nos SLAs;
+   sampling + redacao de PII. Os backends locais (SigNoz/Grafana/Langfuse) ficam
+   para tras — nao acompanham o agente ate producao.
 
 ## Checklist de observabilidade
 
@@ -259,8 +375,12 @@ Resources:
 - [ ] `configure_agno_logging` apontando para o mesmo logger/formato.
 - [ ] `request_id` no log E no span (correlacao trace<->log).
 - [ ] `debug_mode` ligado so em dev; desligado em producao.
-- [ ] Tracing OTel exportando (local: OTLP para SigNoz/Jaeger/Langfuse).
+- [ ] Tracing OTel exportando (dev: OTLP para SigNoz/Jaeger/Langfuse; **prod: X-Ray**).
+- [ ] Producao usa **exclusivamente CloudWatch (logs/metricas) + X-Ray (traces)**;
+      backends locais nao vao para producao.
 - [ ] Em Lambda: ADOT layer + `Tracing: Active`; flush de spans garantido.
 - [ ] Metricas de fallback/latencia/tokens (OTel ou EMF) + alarmes nos SLAs.
 - [ ] Sem PII/segredos em logs ou traces; sampling configurado em producao.
 - [ ] Observabilidade so em `infrastructure`/`composition_root`; dominio limpo.
+- [ ] Se houver RAG: spans/metricas de retrieval ligados por env (`RAG_TRACING_ENABLED`,
+      `RAG_METRICS_ENABLED`); conteudo de chunk (`RAG_TRACE_CONTENT`) so em dev.

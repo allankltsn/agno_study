@@ -24,7 +24,7 @@ trocar o destino por env, nunca o codigo.
 
 | Servico local (Docker) | Substitui em producao | Para que serve no estudo |
 |------------------------|------------------------|--------------------------|
-| **LocalStack** | API Gateway, Lambda, DynamoDB, Secrets Manager, SSM | Testar o deploy serverless (SAM) sem conta AWS |
+| **LocalStack** | API Gateway, Lambda, DynamoDB, Secrets Manager, S3, SSM | Testar o deploy serverless (SAM) sem conta AWS |
 | **Ollama** | Provider LLM (OpenAI/Groq) | Provider local para fallback offline, custo zero |
 | **AgentOS Agno** | (ferramenta de dev) | UI para acompanhar runs, sessions, traces do agente |
 | **SigNoz** (perfil padrao) | CloudWatch + X-Ray | Backend OTLP tudo-em-um: traces, logs e metricas |
@@ -50,7 +50,9 @@ agents/<id>-<nome>/
 │   └── datasources.yaml         # Tempo/Loki/Prometheus provisionados no Grafana
 ├── localstack/
 │   └── init/
-│       └── 01-bootstrap.sh      # cria tabela DynamoDB, segredo, etc. no LocalStack
+│       └── 01-bootstrap.sh      # cria DynamoDB, segredo, bucket S3 de prompts
+├── prompts/
+│   └── system_prompt.md         # prompt de preferencia enviado ao bucket S3 no bootstrap
 ├── agentos/
 │   └── app.py                   # AgentOS que "veste" o agente para acompanhamento
 └── src/ ...                     # o agente (ver agno-project-architecture-solid)
@@ -72,7 +74,7 @@ services:
     ports:
       - "4566:4566"            # endpoint unico de todos os servicos AWS
     environment:
-      SERVICES: "apigateway,lambda,dynamodb,secretsmanager,ssm,iam,logs,cloudformation,sts"
+      SERVICES: "apigateway,lambda,dynamodb,secretsmanager,s3,ssm,iam,logs,cloudformation,sts"
       DEBUG: "0"
     volumes:
       - "./localstack/init:/etc/localstack/init/ready.d"  # scripts de bootstrap
@@ -233,6 +235,12 @@ AWS_ACCESS_KEY_ID=test
 AWS_SECRET_ACCESS_KEY=test
 AWS_DEFAULT_REGION=us-east-1
 
+# Prompts de preferencia no S3 (fonte canonica do system prompt)
+PROMPTS_BUCKET=suporte-prompts
+PROMPTS_KEY=suporte/system_prompt.md
+# Segredo com as chaves de API (Secrets Manager)
+SECRET_NAME=suporte-llm-keys
+
 # Observabilidade -> collector local (SigNoz padrao ou Grafana)
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 OTEL_SERVICE_NAME=suporte-sla-fallback
@@ -246,18 +254,44 @@ Regra: .env.local nunca e commitado (esta no .gitignore); versione so o
 Scripts em localstack/init/*.sh rodam quando o LocalStack fica pronto. Use o awslocal
 (CLI do LocalStack) para criar os recursos que o agente espera.
 
+Crie recursos de forma **idempotente** (o LocalStack pode reexecutar os scripts a
+cada boot): trate "ja existe" como sucesso.
+
 ```bash
 # localstack/init/01-bootstrap.sh
+set -euo pipefail
+
+DYNAMODB_TABLE="${DYNAMODB_TABLE:-sessions}"
+SECRET_NAME="${SECRET_NAME:-suporte-llm-keys}"
+PROMPTS_BUCKET="${PROMPTS_BUCKET:-suporte-prompts}"
+PROMPTS_KEY="${PROMPTS_KEY:-suporte/system_prompt.md}"
+
+# DynamoDB (sessions)
+awslocal dynamodb describe-table --table-name "$DYNAMODB_TABLE" >/dev/null 2>&1 || \
 awslocal dynamodb create-table \
-  --table-name sessions \
+  --table-name "$DYNAMODB_TABLE" \
   --attribute-definitions AttributeName=session_id,AttributeType=S \
   --key-schema AttributeName=session_id,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST
 
+# Secrets Manager (chaves de API)
+awslocal secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1 || \
 awslocal secretsmanager create-secret \
-  --name suporte-llm-keys \
+  --name "$SECRET_NAME" \
   --secret-string '{"OPENAI_API_KEY":"local-placeholder"}'
+
+# S3: bucket dos prompts de preferencia (fonte canonica do system prompt)
+awslocal s3api head-bucket --bucket "$PROMPTS_BUCKET" >/dev/null 2>&1 || \
+awslocal s3 mb "s3://$PROMPTS_BUCKET"
+
+# Sobe um prompt de preferencia inicial se ainda nao existir
+awslocal s3api head-object --bucket "$PROMPTS_BUCKET" --key "$PROMPTS_KEY" >/dev/null 2>&1 || \
+awslocal s3 cp ./prompts/system_prompt.md "s3://$PROMPTS_BUCKET/$PROMPTS_KEY"
 ```
+
+> O bucket `$PROMPTS_BUCKET` guarda os **prompts de preferencia** (persona +
+> regras canonicas). Ver skill `agno-prompt-system` para como o agente le esse
+> prompt do S3 com fallback local.
 
 ## Fluxo de trabalho local
 
@@ -307,5 +341,5 @@ docker compose down
 - [ ] .env.local fora do repo; so .env.local.example versionado; sem chaves reais.
 - [ ] Endpoints (AWS, OTLP, Ollama) vem por env; codigo do agente nao muda entre local e prod.
 - [ ] Ollama com ao menos um modelo baixado para servir de fallback offline.
-- [ ] LocalStack com tabela/segredo criados via script de bootstrap.
+- [ ] LocalStack com tabela DynamoDB, segredo (Secrets Manager) e bucket S3 de prompts criados via bootstrap (idempotente).
 - [ ] Traces do Agno visiveis no backend escolhido; log estruturado sem PII/segredos.
